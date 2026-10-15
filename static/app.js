@@ -1438,7 +1438,7 @@ function renderIncident(main) {
     main.innerHTML = `<button class="link-btn" data-back style="margin-bottom:12px">All incidents</button>` +
       head(`${esc(inc.name)} <span class="${t.move >= 0 ? 'up' : 'down'}">${t.move >= 0 ? '▲' : '▼'} ${Math.abs(t.move).toFixed(2)}%</span>`,
         `${esc(KIND_TRIG[inc.kind] || (inc.manual ? 'Manual investigation' : 'Automatic trigger'))} on ${esc(inc.symbol)} at ${istTime(t.time)}. ${esc(inc.reason || '')}${done ? ` Report ready ${inc.duration_min} min after the trigger.` : ''}`,
-        done ? `<div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn ghost" href="/api/surveillance/incidents/${enc(inc.id)}/report.html" download>Download report</a>
+        done ? `<div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn ghost" href="/api/surveillance/incidents/${enc(inc.id)}/report.pdf" download>Download PDF</a>
           <button class="btn" id="mailRep">Email report</button></div>` : '') +
       (inc.status === 'failed' ? `<div class="empty" style="margin-bottom:16px"><h3>The investigation failed</h3><p>${esc(inc.error || '')}</p></div>` : '') +
       `<div class="panel"><h3>Progress</h3>${steps}</div>` +

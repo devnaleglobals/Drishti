@@ -271,7 +271,8 @@ def _send(to, subject, html, text, attachment):
         m.set_content(text or "This message is best viewed in an email client that shows HTML.")
         m.add_alternative(html, subtype="html")
         if attachment:
-            m.add_attachment(attachment[1], maintype="text", subtype=attachment[2], filename=attachment[0])
+            maintype = "application" if attachment[2] == "pdf" else "text"
+            m.add_attachment(attachment[1], maintype=maintype, subtype=attachment[2], filename=attachment[0])
         ctx = ssl.create_default_context()
         if eff["security"] == "ssl":
             server = smtplib.SMTP_SSL(eff["host"], eff["port"], context=ctx, timeout=25)

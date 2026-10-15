@@ -84,8 +84,17 @@ def _quoted(t: str) -> str:
     return f'"{t}"' if re.search(r"\s", t) else t
 
 
+def _search_terms(terms):
+    """Terms safe to send to outside search engines.
+    Those engines ignore case, so a ticker like RELIANCE becomes the word "reliance" and matches anything.
+    Single all-caps words (tickers, abbreviations) are dropped whenever a fuller name is available."""
+    terms = [t for t in terms if t and t.strip()]
+    full = [t for t in terms if not (t.isupper() and " " not in t.strip())]
+    return full or terms
+
+
 def _or(terms, n=6) -> str:
-    return " OR ".join(_quoted(t) for t in terms[:n])
+    return " OR ".join(_quoted(t) for t in _search_terms(terms)[:n])
 
 
 # --------------------------------------------------------------------------
@@ -261,7 +270,7 @@ def c_yahoo(ctx):
 
 
 def c_gdelt(ctx):
-    terms = [t for t in ctx["profile"]["company"] + ctx["profile"].get("people", []) if len(t) >= 4][:6]
+    terms = [t for t in _search_terms(ctx["profile"]["company"]) + ctx["profile"].get("people", []) if len(t) >= 4][:6]
     if not terms:
         return []
     q = _or(terms, 6)
@@ -605,6 +614,9 @@ def _availability(c, symbol):
 # --------------------------------------------------------------------------
 # Run everything
 # --------------------------------------------------------------------------
+TRUSTED = {"yahoo", "nse_filings", "bse_filings", "finnhub", "custom_feeds"}
+
+
 def _norm(t: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", t.lower())[:70]
 
@@ -644,15 +656,19 @@ def fetch_all(symbol: str, profile: dict, days: int, region: str):
     merged: dict[str, dict] = {}
     health = []
     for c, items, status, note, ms in results:
-        kept, newest = 0, None
+        kept, newest, dropped = 0, None, 0
         for it in items:
             ts = it.get("published")
             if ts is None or pd.isna(ts) or ts < cutoff or ts > future or not it.get("title"):
                 continue
-            # Prefer the most specific group the headline mentions (company beats product beats material).
+            # Relevance gate: results from search engines must actually mention one of the keywords.
+            # Company-specific feeds (exchange filings, ticker news, custom feeds) are trusted as they are.
             hit = matcher.match(it["title"] + " " + it.get("summary", ""))
             if hit:
                 it["group"], it["keyword"] = hit
+            elif c["id"] not in TRUSTED:
+                dropped += 1
+                continue
             key = _norm(it["title"])
             kept += 1
             newest = ts if newest is None or ts > newest else newest
@@ -668,6 +684,8 @@ def fetch_all(symbol: str, profile: dict, days: int, region: str):
                 it["outlets"] = {it["source"]}
                 it["connectors"] = {c["id"]}
                 merged[key] = it
+        if dropped:
+            note = (note + ". " if note else "") + f"{dropped} unrelated result(s) removed"
         health.append({"id": c["id"], "name": c["name"], "kind": c["kind"], "status": status, "note": note,
                        "count": kept, "newest": newest.isoformat() if newest is not None else None, "ms": ms,
                        "desc": c["desc"]})

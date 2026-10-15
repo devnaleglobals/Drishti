@@ -522,6 +522,17 @@ def sv_report(inc_id: str):
         "Content-Disposition": f'attachment; filename="{inc["symbol"]}_movement_report.html"'})
 
 
+@app.get("/api/surveillance/incidents/{inc_id}/report.pdf")
+def sv_report_pdf(inc_id: str):
+    from fastapi.responses import Response
+    import report_pdf
+    inc = SV.get_incident(inc_id)
+    if not inc or inc.get("status") != "complete":
+        raise HTTPException(404, "Report not ready")
+    return Response(report_pdf.build(inc), media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="{inc["symbol"]}_movement_report.pdf"'})
+
+
 @app.post("/api/surveillance/incidents/{inc_id}/email")
 def sv_email(inc_id: str, body: dict = Body(default={})):
     inc = SV.get_incident(inc_id)
