@@ -403,3 +403,19 @@ tr.edit-row td { background: var(--panel-2); border-top: 0; padding: 4px 14px 16
 .verify { margin-top: 12px; padding: 10px 12px; border-radius: 6px; font-size: .88rem; border-left: 3px solid; }
 .verify.ok { border-color: var(--gain); background: rgba(60, 196, 139, .08); }
 .verify.bad { border-color: var(--loss); background: rgba(242, 97, 107, .08); }
+
+/* Timeline tooltip */
+.chart { position: relative; }
+.tip { position: absolute; z-index: 5; width: 360px; max-width: calc(100% - 8px); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px; box-shadow: 0 12px 30px rgba(3, 10, 20, .55); pointer-events: none; font-size: .85rem; }
+.tip.pinned { pointer-events: auto; border-color: var(--accent); }
+.tip-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; margin-bottom: 6px; color: var(--muted); }
+.tip-head b { color: var(--text); font-size: .95rem; }
+.tip-x { margin-left: auto; padding: 0 4px; }
+.tip-onset { color: var(--caution); font-weight: 500; margin-bottom: 6px; }
+.tip-item { display: grid; grid-template-columns: 10px 1fr; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line-soft); }
+.tip-item i { width: 9px; height: 9px; border-radius: 50%; margin-top: 5px; }
+.tip-item b, .tip-item a { display: block; color: var(--text); font-weight: 500; line-height: 1.35; }
+.tip-item a:hover { color: var(--accent); }
+.tip-item span { color: var(--dim); font-size: .78rem; }
+.tip-more { color: var(--dim); font-size: .78rem; margin-top: 4px; }

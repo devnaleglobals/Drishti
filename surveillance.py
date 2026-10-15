@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "auto_email_report": True,
 }
 
-STEPS = [("trigger", "Trigger detected"), ("alert", "Alert email"), ("collect", "Sources searched"),
+STEPS = [("trigger", "Trigger detected"), ("collect", "Sources searched"), ("alert", "Alert email with early findings"),
          ("classify", "AI classification and clustering"), ("assess", "Assessment"), ("report", "Report written"),
          ("email", "Report emailed")]
 
@@ -437,7 +437,78 @@ def _webhooks(cfg: dict, title: str, lines: list[str], link: str, category: str,
     return out
 
 
-def _alert_email(inc: dict) -> None:
+def _span(minutes: int) -> str:
+    """Readable gap: 21 min, 2 h 5 min, 1 day 19 h."""
+    m = abs(int(minutes))
+    if m < 60:
+        return f"{m} min"
+    if m < 1440:
+        return f"{m // 60} h" + (f" {m % 60} min" if m % 60 else "")
+    d, h = m // 1440, (m % 1440) // 60
+    return f"{d} day{'s' if d > 1 else ''}" + (f" {h} h" if h else "")
+
+
+def _early_findings(inc: dict, ev: list[dict]) -> dict:
+    """Quick ranking before AI: credibility x timing x tone, used for the alert email."""
+    move_up = inc["trigger"]["value"] > 0
+    scored = []
+    for e in ev:
+        tone = A.keyword_sentiment(e["title"] + " " + e.get("summary", ""))
+        m = e["minutes_vs_onset"]
+        timing = 1.0 if -24 * 60 <= m <= 0 else 0.75 if m < -24 * 60 else 0.55
+        match = 1.0 if (tone > 0.15) == move_up and abs(tone) > 0.15 else 0.7
+        score = CR.TIERS[e["tier"]]["weight"] * timing * match * (1 + 0.1 * min(e.get("coverage", 1) - 1, 5))
+        scored.append({**e, "tone": tone, "score": score})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    filings = [e for e in ev if e["kind"] == "filing"]
+    before = sum(1 for e in ev if e["minutes_vs_onset"] <= 0)
+    return {"top": scored[:5], "filings": filings[:3], "count": len(ev), "before": before,
+            "sources": len({e["source"] for e in ev})}
+
+
+def _mini_report_html(inc: dict, early: dict | None) -> str:
+    esc = html.escape
+    p = inc.get("price") or {}
+
+    def pc(v):
+        return "–" if v is None else "%+.2f%%" % (v * 100)
+
+    path = (f'<table cellpadding="5" style="border-collapse:collapse;font-size:13px;margin:6px 0 12px">'
+            f'<tr><td style="color:#5B6B7F">{esc(p.get("split_label", "Pre-9:30"))} move</td><td><b>{pc(p.get("pre_930"))}</b></td>'
+            f'<td style="color:#5B6B7F;padding-left:18px">After that</td><td><b>{pc(p.get("post_930"))}</b></td></tr>'
+            f'<tr><td style="color:#5B6B7F">Move started</td><td><b>{esc(p.get("onset_local") or "–")}</b> (exchange time)</td>'
+            f'<td style="color:#5B6B7F;padding-left:18px">Volume</td><td><b>{("%.1fx" % p["volume_ratio"]) if p.get("volume_ratio") else "–"}</b> the 20-day average</td></tr>'
+            f'<tr><td style="color:#5B6B7F">Day range</td><td>{(p.get("low") or 0):,.2f} to {(p.get("high") or 0):,.2f}</td>'
+            f'<td style="color:#5B6B7F;padding-left:18px">Open</td><td>{(p.get("open") or 0):,.2f}</td></tr></table>') if p else ""
+    if not early:
+        return (f'<h3 style="font-size:15px;margin:14px 0 4px">Price path</h3>{path}' if path else "") +             '<p>The source scan could not finish, so this alert carries price data only. The full report will follow.</p>'
+    rows = ""
+    for e in early["top"]:
+        tone = e["tone"]
+        tc = "#067647" if tone > 0.15 else "#B42318" if tone < -0.15 else "#5B6B7F"
+        when = f"{_span(e['minutes_vs_onset'])} {'before' if e['minutes_vs_onset'] <= 0 else 'after'}"
+        rows += (f'<tr><td style="white-space:nowrap;vertical-align:top">{esc(e["time"])}<br><span style="color:#8DA2BA;font-size:12px">{when} the start</span></td>'
+                 f'<td style="vertical-align:top"><a href="{esc(e["url"] or "#")}" style="color:#1F5FAD">{esc(e["title"][:150])}</a><br>'
+                 f'<span style="color:#5B6B7F;font-size:12px">{esc(e["source"])}, {esc(CR.TIERS[e["tier"]]["label"])}'
+                 f'{", reported by %d outlets" % e["coverage"] if e.get("coverage", 1) > 1 else ""}</span></td>'
+                 f'<td style="color:{tc};vertical-align:top;white-space:nowrap">{"positive" if tone > 0.15 else "negative" if tone < -0.15 else "neutral"}</td></tr>')
+    if not rows:
+        rows = '<tr><td colspan="3" style="color:#5B6B7F">No public news, filings or posts found in the window yet.</td></tr>'
+    fil = "".join(f'<li><a href="{esc(f["url"] or "#")}">{esc(f["title"][:150])}</a> <span style="color:#5B6B7F">{esc(f["source"])}, {esc(f["time"])}</span></li>'
+                  for f in early["filings"])
+    return (f'<h3 style="font-size:15px;margin:16px 0 4px">Price path</h3>{path}'
+            f'<h3 style="font-size:15px;margin:16px 0 4px">Early findings</h3>'
+            f'<p style="margin:0 0 6px;color:#5B6B7F">{early["count"]} items from {early["sources"]} sources in the window, '
+            f'{early["before"]} published before the move started. Top items, ranked by credibility and timing:</p>'
+            f'<table cellpadding="6" border="1" style="border-collapse:collapse;border-color:#D0D7E2;font-size:13px;width:100%">'
+            f'<tr style="background:#EEF2F7"><th align="left">Published (IST)</th><th align="left">Item</th><th align="left">Tone</th></tr>{rows}</table>'
+            + (f'<h3 style="font-size:15px;margin:16px 0 4px">Exchange and regulator filings</h3><ul style="margin:0;padding-left:18px;font-size:13px">{fil}</ul>' if fil else
+               '<p style="font-size:13px;color:#5B6B7F;margin-top:10px">No exchange or regulator filing found in the window.</p>')
+            + '<p style="font-size:13px;margin-top:12px"><b>Preliminary.</b> These are ranked by keywords, source credibility and timing only. '
+              'AI classification, rumour clustering and the material-movement assessment are in progress; the full report follows by email.</p>')
+
+
+def _alert_email(inc: dict, early: dict | None = None) -> None:
     cfg = load_config()
     t = inc["trigger"]
     arrow = "▲" if t["value"] > 0 else "▼"
@@ -449,7 +520,7 @@ def _alert_email(inc: dict) -> None:
     adj_txt = "" if t.get("adjusted") is None else "<b>%+.2f%%</b>" % t["adjusted"]
     link_txt = ('<p><a href="%s">Open the incident in Drishti</a></p>' % html.escape(link)) if link else ""
     body = f"""<div style="font-family:Arial,sans-serif;font-size:14px;color:#16202C">
-<h2 style="margin:0 0 8px">{html.escape(inc['name'])} ({inc['symbol']}) {arrow} {t['move']:+.2f}%</h2>
+<h2 style="margin:0 0 8px">{html.escape(inc['name'])} ({inc['symbol']}) {arrow} {abs(t['move']):.2f}%</h2>
 <p style="margin:0 0 12px;color:#5B6B7F">{html.escape(TRIGGER_KINDS.get(inc.get('kind', 'manual'), 'Trigger'))} at {when}. {html.escape(inc.get('reason', ''))}</p>
 <table cellpadding="6" style="border-collapse:collapse;font-size:14px">
 <tr><td style="color:#5B6B7F">Last price</td><td><b>{t.get('last') or 0:,.2f}</b> {html.escape(t.get('currency') or '')}</td></tr>
@@ -458,16 +529,19 @@ def _alert_email(inc: dict) -> None:
 <tr><td style="color:#5B6B7F">{html.escape(t.get('benchmark') or 'Index')} move</td><td>{idx_txt}</td></tr>
 <tr><td style="color:#5B6B7F">Index-adjusted move</td><td>{adj_txt}</td></tr>
 <tr><td style="color:#5B6B7F">Triggers</td><td>+{t.get('up_pct', t['threshold']):g}% high / -{t.get('down_pct', t['threshold']):g}% low ({cfg['basis']})</td></tr></table>
-<p>The investigation has started: news, filings, social media and forums are being searched for the trigger window.
-The evidence-based report will follow by email.</p>
+{_mini_report_html(inc, early)}
 {link_txt}
 <p style="color:#8DA2BA;font-size:12px">Automated surveillance alert. For internal assessment; not investment advice.</p></div>"""
     ok, msg = N.send(recipients_for(inc["symbol"], cfg), subj, body, category="alert")
     inc["emails"].append({"type": "alert", "ok": ok, "message": msg, "at": datetime.now(timezone.utc).isoformat()})
-    hooks = _webhooks(cfg, subj.replace("[Drishti] ", ""), [inc.get("reason", ""), f"{adj.strip()}" if adj else "",
-                      "Investigation started. The report will follow."], link, "alert",
+    top_lines = [f"{e['time']}: {e['title'][:110]} ({e['source']})" for e in (early or {}).get("top", [])[:3]]
+    hooks = _webhooks(cfg, subj.replace("[Drishti] ", ""), [inc.get("reason", ""), f"{adj.strip()}" if adj else ""]
+                      + (["Early findings:"] + top_lines if top_lines else []) + ["Full report to follow."], link, "alert",
                       {"incident": inc["id"], "symbol": inc["symbol"], "move": t["move"]})
     note = msg + (f". Webhooks: {'; '.join(hooks)}" if hooks else "")
+    if early:
+        inc["early"] = {"count": early["count"], "before": early["before"], "sources": early["sources"],
+                        "top": [{k: e.get(k) for k in ("title", "source", "url", "time", "tier", "minutes_vs_onset", "tone")} for e in early["top"]]}
     _step(inc, "alert", "done" if ok or any("delivered" in h for h in hooks) else "skipped", note)
 
 
@@ -572,11 +646,17 @@ def _cluster_score(c: dict, onset: pd.Timestamp, move_dir: str) -> float:
 def _run(inc_id: str) -> None:
     inc = get_incident(inc_id)
     try:
-        _alert_email(inc)
         _investigate(inc)
     except Exception as e:
         traceback.print_exc()
         inc = get_incident(inc_id) or inc
+        # Never lose the alert: if the scan failed before it went out, send the basic one now.
+        if any(st["key"] == "alert" and st["state"] in ("pending", "running") for st in inc["steps"]):
+            try:
+                _alert_email(inc, None)
+                inc = get_incident(inc_id) or inc
+            except Exception:
+                traceback.print_exc()
         inc["status"] = "failed"
         inc["error"] = str(e)[:300]
         for s in inc["steps"]:
@@ -617,6 +697,12 @@ def _investigate(inc: dict) -> None:
     inc["health"] = [{k: h[k] for k in ("id", "name", "kind", "status", "count", "note")} for h in health]
     working = sum(1 for h in health if h["status"] == "ok")
     _step(inc, "collect", "done", f"{len(ev)} items in the window from {working} sources")
+    _step(inc, "alert", "running", "Sending the alert with early findings")
+    try:
+        _alert_email(inc, _early_findings(inc, ev))
+    except Exception as e:
+        print(f"[surveillance] alert email failed: {e}", flush=True)
+        _step(inc, "alert", "skipped", f"Alert failed: {str(e)[:120]}")
 
     # 3. Classify and cluster --------------------------------------------
     _step(inc, "classify", "running", "")

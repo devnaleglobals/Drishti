@@ -1514,6 +1514,58 @@ function renderIncident(main) {
       marks.sort((x, y) => x.time - y.time);
       ls.setMarkers(marks);
       ch.timeScale().fitContent();
+
+      // Hover a dot to see the items behind it; click to pin the box so the links can be clicked.
+      const byBar = {};
+      (inc.evidence || []).forEach(e => { const at = snap(e.published); if (at) (byBar[at] ||= []).push(e); });
+      const box = $('#cInc');
+      const tip = document.createElement('div');
+      tip.className = 'tip';
+      tip.hidden = true;
+      box.appendChild(tip);
+      let pinned = false;
+      const near = t => {
+        const i = times.indexOf(t);
+        if (i < 0) return { t, items: [] };
+        for (const d of [0, -1, 1, -2, 2]) {           // a little slack so the dots are easy to hit
+          const tt = times[i + d];
+          if (tt != null && byBar[tt]) return { t: tt, items: byBar[tt] };
+        }
+        return { t, items: [] };
+      };
+      const hhmm = t => new Date(t * 1000).toISOString().slice(11, 16);
+      const span = m => { m = Math.abs(m); if (m < 60) return m + ' min'; if (m < 1440) return Math.floor(m / 60) + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : '');
+        const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60); return d + ' day' + (d > 1 ? 's' : '') + (h ? ' ' + h + ' h' : ''); };
+      const show = (param, pin) => {
+        const { t: at, items } = near(param.time);
+        const isOnset = onsetT && Math.abs(times.indexOf(at) - times.indexOf(onsetT)) <= 1;
+        if (!items.length && !isOnset) { if (!pinned || pin) { tip.hidden = true; pinned = false; } return; }
+        const mins = items[0]?.minutes_vs_onset;
+        tip.innerHTML = `<div class="tip-head"><b>${hhmm(at)}</b>${items.length ? ` <span>${items.length} item${items.length > 1 ? 's' : ''}</span>` : ''}
+            ${mins != null ? `<span class="${mins <= 0 ? 'down' : ''}">${span(mins)} ${mins <= 0 ? 'before' : 'after'} the move started</span>` : ''}
+            ${pin ? '<button class="icon-btn tip-x" aria-label="Close">✕</button>' : ''}</div>
+          ${isOnset ? '<div class="tip-onset">The move starts here</div>' : ''}
+          ${items.slice(0, 4).map(e => `<div class="tip-item"><i style="background:${e.direction === 'negative' ? C.loss : e.direction === 'positive' ? C.gain : C.neutral}"></i>
+            <div>${pin ? `<a href="${esc(safeUrl(e.url))}" target="_blank" rel="noopener">${esc(e.title)}</a>` : `<b>${esc(e.title)}</b>`}
+            <span>${esc(e.source)}, ${TIER_LABEL[e.tier] || ''}${e.type ? ', ' + (TYPE_LABEL[e.type] || e.type) : ''}${e.direction ? ', ' + esc(e.direction) : ''}</span></div></div>`).join('')}
+          ${items.length > 4 ? `<div class="tip-more">+${items.length - 4} more in the evidence trail below</div>` : ''}
+          ${!pin && items.length ? '<div class="tip-more">Click to pin and open the links</div>' : ''}`;
+        tip.hidden = false;
+        tip.classList.toggle('pinned', !!pin);
+        const w = box.clientWidth, x = param.point.x, y = param.point.y;
+        tip.style.left = Math.max(4, Math.min(x + 16, w - tip.offsetWidth - 4)) + 'px';
+        tip.style.top = Math.max(4, y - tip.offsetHeight - 12) + 'px';
+        if (pin) {
+          pinned = true;
+          tip.querySelector('.tip-x').onclick = ev => { ev.stopPropagation(); tip.hidden = true; pinned = false; };
+        }
+      };
+      ch.subscribeCrosshairMove(param => {
+        if (pinned) return;
+        if (!param.time || !param.point) { tip.hidden = true; return; }
+        show(param, false);
+      });
+      ch.subscribeClick(param => { if (param.time && param.point) show(param, true); });
     }
     // keep refreshing until every step (including the report email) has finished
     if (inc.status !== 'failed' && inc.steps.some(s => s.state === 'pending' || s.state === 'running')) svPoll(load, 4000);
