@@ -219,16 +219,16 @@ def _feed_result(url: str, parsed) -> dict:
 
 def test_feed(url: str) -> dict:
     """Used by the Test button. Accepts a feed address or a normal web page:
-    for a web page it looks for the site's own feed, then falls back to Google News for that site."""
+    for a web page it looks for the site's own feed, then falls back to Google News for that site.
+    Sites that block servers (403) also get the Google News fallback."""
+    from urllib.parse import urljoin
+    first_error = ""
     try:
         r, parsed = _try_feed(url)
         if parsed.entries:
             return _feed_result(url, parsed)
-        # A normal web page: look for <link rel="alternate" type="application/rss+xml" href="...">
-        from urllib.parse import urljoin
-        html_text = r.text[:400000]
         found = []
-        for tag in re.findall(r"<link[^>]+>", html_text, re.I):
+        for tag in re.findall(r"<link[^>]+>", r.text[:400000], re.I):
             if re.search(r"type=[\"'](application/(rss|atom)\+xml)", tag, re.I):
                 m = re.search(r"href=[\"']([^\"']+)", tag, re.I)
                 if m:
@@ -238,26 +238,27 @@ def test_feed(url: str) -> dict:
                 _, p2 = _try_feed(cand)
                 if p2.entries:
                     res = _feed_result(cand, p2)
-                    res["discovered"] = True
-                    res["note"] = "That was a web page. Found the site's own feed instead."
+                    res.update(discovered=True, note="That was a web page. Found the site's own feed instead.")
                     return res
             except Exception:
                 continue
-        host = _domain(url)
-        if host:
-            gurl = f"https://news.google.com/rss/search?q={quote_plus('site:' + host)}&hl=en-IN&gl=IN&ceid=IN:en"
-            try:
-                _, p3 = _try_feed(gurl)
-                if p3.entries:
-                    res = _feed_result(gurl, p3)
-                    res["discovered"] = True
-                    res["note"] = f"{host} has no feed of its own, so this uses Google News for that site."
-                    return res
-            except Exception:
-                pass
-        return {"ok": False, "error": "No articles found. This is not an RSS or Atom feed, and no feed could be found for the site."}
+        first_error = "No RSS or Atom feed found on that page."
     except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+        msg = str(e)
+        first_error = ("The site blocks requests from this server." if "403" in msg or "401" in msg
+                       else msg[:160])
+    host = _domain(url)
+    if host:
+        gurl = f"https://news.google.com/rss/search?q={quote_plus('site:' + host)}&hl=en-IN&gl=IN&ceid=IN:en"
+        try:
+            _, p3 = _try_feed(gurl)
+            if p3.entries:
+                res = _feed_result(gurl, p3)
+                res.update(discovered=True, note=f"{first_error} Using Google News for {host} instead, which lists the same articles.")
+                return res
+        except Exception:
+            pass
+    return {"ok": False, "error": first_error or "No articles found."}
 
 
 def c_publishers(ctx):
