@@ -593,7 +593,17 @@ def get_email_settings():
 
 @app.put("/api/settings/email")
 def put_email_settings(body: dict = Body(...)):
-    return N.save_config(body)
+    try:
+        cfg = N.save_config(body)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    cfg["verify"] = N.verify() if cfg.get("ready") else None
+    return cfg
+
+
+@app.get("/api/settings/email/verify")
+def verify_email_settings():
+    return N.verify()
 
 
 @app.get("/api/settings/email/diagnose")

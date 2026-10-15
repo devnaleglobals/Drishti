@@ -396,3 +396,10 @@ tr.edit-row td { background: var(--panel-2); border-top: 0; padding: 4px 14px 16
 .diag { display: grid; gap: 4px; margin-top: 10px; }
 .diag > div { display: grid; grid-template-columns: 200px 200px 1fr; gap: 10px; font-size: .85rem; align-items: center; }
 @media (max-width: 860px) { .diag > div { grid-template-columns: 1fr; } }
+
+.key-saved { font-size: .8rem; color: var(--gain); margin-top: 2px; }
+.key-saved.none { color: var(--caution); }
+.key-saved code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; color: var(--text); }
+.verify { margin-top: 12px; padding: 10px 12px; border-radius: 6px; font-size: .88rem; border-left: 3px solid; }
+.verify.ok { border-color: var(--gain); background: rgba(60, 196, 139, .08); }
+.verify.bad { border-color: var(--loss); background: rgba(242, 97, 107, .08); }

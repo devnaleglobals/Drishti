@@ -100,6 +100,8 @@ def public_config() -> dict:
         "username": raw.get("username", ""), "from_name": raw.get("from_name", "Drishti Alerts"),
         "from_email": raw.get("from_email", ""), "reply_to": raw.get("reply_to", ""),
         "has_password": bool(raw.get("password")), "has_api_key": bool(raw.get("api_key")),
+        "api_key_hint": raw.get("api_key_hint", "") if raw.get("api_key") else "",
+        "api_key_saved": raw.get("api_key_saved") if raw.get("api_key") else None,
         "secret_unreadable": bool((raw.get("password") and not _dec(raw["password"]))
                                   or (raw.get("api_key") and not _dec(raw["api_key"]))),
         "source": src, "env_method": (env or {}).get("method", ""), "presets": PRESETS,
@@ -130,7 +132,13 @@ def save_config(body: dict) -> dict:
             pw = re.sub(r"\s+", "", pw)  # Google shows app passwords in groups of four
         raw["password"] = _enc(pw)
     if body.get("api_key"):
-        raw["api_key"] = _enc(str(body["api_key"]))
+        key = re.sub(r"\s+", "", str(body["api_key"]))  # copied keys often carry spaces or line breaks
+        if provider == "brevo" and key.startswith("xsmtpsib-"):
+            raise ValueError("This is a Brevo SMTP key. Use an API key instead: in Brevo open SMTP & API > API keys "
+                             "> Generate a new API key. It starts with xkeysib-.")
+        raw["api_key"] = _enc(key)
+        raw["api_key_hint"] = key[:8] + "..." + key[-4:]
+        raw["api_key_saved"] = datetime.now(timezone.utc).isoformat()
     if body.get("clear_secrets"):
         raw["password"], raw["api_key"] = "", ""
     with _lock:
@@ -340,3 +348,60 @@ def diagnose() -> list[dict]:
             out.append({"name": name, "target": f"{host}:{port}", "ok": False,
                         "message": "Blocked by the host's network" if blocked else str(e)[:120]})
     return out
+
+
+
+def verify() -> dict:
+    """Ask the email provider whether the saved key works and the sender is verified."""
+    eff = _effective()
+    if not eff:
+        return {"ok": False, "message": "Email is not configured yet."}
+    try:
+        if eff["method"] == "brevo":
+            h = {"api-key": eff["api_key"], "accept": "application/json"}
+            r = requests.get("https://api.brevo.com/v3/account", headers=h, timeout=15)
+            if r.status_code == 401:
+                msg = r.json().get("message", "") if r.headers.get("content-type", "").startswith("application/json") else r.text
+                if "ip" in msg.lower():
+                    return {"ok": False, "message": "Brevo blocked this server's IP address. In Brevo: Security > Authorised IPs, "
+                                                    "turn off IP blocking or add Render's address."}
+                return {"ok": False, "message": "Brevo does not recognise this key. Make sure it is an API key (starts with "
+                                                "xkeysib-, not xsmtpsib-), copied completely, and not deleted in Brevo."}
+            if r.status_code >= 300:
+                return {"ok": False, "message": f"Brevo error {r.status_code}: {r.text[:160]}"}
+            account = r.json().get("email", "")
+            _, sender = parseaddr(eff["sender"])
+            sender_ok, sender_msg = None, ""
+            rs = requests.get("https://api.brevo.com/v3/senders", headers=h, timeout=15)
+            if rs.status_code < 300:
+                senders = rs.json().get("senders", [])
+                match = [x for x in senders if x.get("email", "").lower() == (sender or "").lower()]
+                sender_ok = bool(match and match[0].get("active", True))
+                sender_msg = ("Sender verified" if sender_ok else
+                              f"{sender or 'The sender email'} is not a verified sender in Brevo. Add it under "
+                              "Senders, Domains & Dedicated IPs and click the link Brevo emails you.")
+            return {"ok": True, "account": account, "sender_ok": sender_ok,
+                    "message": f"Key works (Brevo account {account}). {sender_msg}".strip()}
+        if eff["method"] == "resend":
+            r = requests.get("https://api.resend.com/domains", timeout=15,
+                             headers={"Authorization": f"Bearer {eff['api_key']}"})
+            if r.status_code in (401, 403):
+                return {"ok": False, "message": "Resend does not recognise this key."}
+            return {"ok": r.status_code < 300, "message": "Key works (Resend)." if r.status_code < 300 else r.text[:160]}
+        # SMTP: sign in without sending anything
+        ctx = ssl.create_default_context()
+        server = (smtplib.SMTP_SSL(eff["host"], eff["port"], context=ctx, timeout=15) if eff["security"] == "ssl"
+                  else smtplib.SMTP(eff["host"], eff["port"], timeout=15))
+        with server as srv:
+            if eff["security"] == "starttls":
+                srv.starttls(context=ctx)
+            srv.login(eff["username"], eff["password"])
+        return {"ok": True, "message": f"Signed in to {eff['host']} as {eff['username']}."}
+    except smtplib.SMTPAuthenticationError:
+        return {"ok": False, "message": "The mail server rejected the username or password (Gmail needs an App Password)."}
+    except OSError as e:
+        if getattr(e, "errno", None) in (errno.ENETUNREACH, errno.EHOSTUNREACH) or "timed out" in str(e).lower():
+            return {"ok": False, "message": "This server cannot reach the mail server (email ports blocked). Use Brevo or Resend."}
+        return {"ok": False, "message": f"Connection problem: {str(e)[:160]}"}
+    except Exception as e:
+        return {"ok": False, "message": f"Check failed: {str(e)[:160]}"}

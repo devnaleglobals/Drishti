@@ -1265,7 +1265,8 @@ RENDER.notify = main => {
         <label class="switch" title="Use these settings"><input type="checkbox" id="emOn" ${M.enabled ? 'checked' : ''}><span></span></label></div>
       <div class="form-grid">
         <label class="wide">Provider<select id="emProv">${Object.entries(T.em.presets).map(([k, v]) => `<option value="${k}" ${M.provider === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}</select></label>
-        ${isApi ? `<label class="wide">${M.provider === 'brevo' ? 'Brevo' : 'Resend'} API key<input type="password" id="emKey" autocomplete="new-password" placeholder="${T.em.has_api_key ? 'Saved. Leave blank to keep it' : M.provider === 'brevo' ? 'xkeysib-...' : 're_...'}" value="${esc(M.api_key)}"></label>`
+        ${isApi ? `<label class="wide">${M.provider === 'brevo' ? 'Brevo API key (starts with xkeysib-)' : 'Resend API key'}<input type="password" id="emKey" autocomplete="new-password" placeholder="${T.em.has_api_key ? 'Saved. Paste a new key only to replace it' : M.provider === 'brevo' ? 'xkeysib-...' : 're_...'}" value="${esc(M.api_key)}">
+          ${T.em.has_api_key ? `<span class="key-saved">Saved key: <code>${esc(T.em.api_key_hint)}</code>${T.em.api_key_saved ? ', ' + istTime(T.em.api_key_saved) : ''}</span>` : '<span class="key-saved none">No key saved yet</span>'}</label>`
           : `<label>SMTP server<input id="emHost" value="${esc(M.host)}" placeholder="smtp.example.com"></label>
              <label>Port<input type="number" id="emPort" value="${M.port}"></label>
              <label>Security<select id="emSec"><option value="starttls" ${M.security === 'starttls' ? 'selected' : ''}>STARTTLS (port 587)</option>
@@ -1279,7 +1280,9 @@ RENDER.notify = main => {
       ${P.hint ? `<p class="kw-help" style="margin-top:10px">${esc(P.hint)}</p>` : ''}
       ${smtpOnRender ? '<p class="kw-help" style="color:var(--caution)">This app runs on Render. Render\'s free plan blocks SMTP, so choose Brevo or Resend unless you are on a paid plan.</p>' : ''}
       <p class="kw-help">Passwords are encrypted on the server and never shown again.${T.em.secret_from_env ? '' : ' Set APP_SECRET on Render for the strongest protection.'}</p>
-      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px"><button class="btn" id="emSave" ${T.dirtyMail ? '' : 'disabled'}>Save email settings</button>
+      ${T.verify ? `<div class="verify ${T.verify.ok ? 'ok' : 'bad'}"><b>${T.verify.ok ? 'Check passed.' : 'Check failed.'}</b> ${esc(T.verify.message)}</div>` : ''}
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px"><button class="btn" id="emSave" ${T.dirtyMail ? '' : 'disabled'}>${T.dirtyMail ? 'Save email settings' : 'Saved'}</button>
+        <button class="btn ghost" id="emVerify" ${T.em.ready ? '' : 'disabled'}>Check settings</button>
         <input id="emTestTo" class="plain-in" style="flex:1;min-width:200px" placeholder="Send a test to (defaults to recipients)"><button class="btn ghost" id="emTest">Send test</button></div>
       <div style="margin-top:14px"><button class="btn ghost" id="emDiag">Check server connection</button>
         <span class="kw-help" style="margin-left:8px">Tests from the server itself which mail services it can reach.</span>
@@ -1313,7 +1316,17 @@ RENDER.notify = main => {
 
   const md_ = () => { T.dirtyMail = true; renderLens(true); };
   const dc = () => { T.dirtyCfg = true; renderLens(true); };
-  const bindVal = (id, key, num) => { const el = $('#' + id); if (el) el.onchange = () => { M[key] = num ? +el.value : el.value; md_(); }; };
+  // Text boxes update as you type without redrawing the page, so a click on Save is never lost.
+  const markMailDirty = () => {
+    T.dirtyMail = true;
+    const b = $('#emSave');
+    if (b) { b.disabled = false; b.textContent = 'Save email settings'; }
+  };
+  const bindVal = (id, key, num) => {
+    const el = $('#' + id);
+    if (!el) return;
+    el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', () => { M[key] = num ? +el.value : el.value; markMailDirty(); });
+  };
   $('#emOn').onchange = e => { M.enabled = e.target.checked; md_(); };
   $('#emProv').onchange = e => {
     M.provider = e.target.value; const pr = T.em.presets[M.provider];
@@ -1327,10 +1340,19 @@ RENDER.notify = main => {
       const r = await fetch('/api/settings/email', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(M) });
       if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
       T.em = await r.json(); T.edit = { ...T.em, password: '', api_key: '' }; T.dirtyMail = false; S.sv = null;
-      toast(T.em.ready ? 'Email settings saved and ready.' : 'Saved, but some details are still missing.', !T.em.ready); renderLens(true);
+      T.verify = T.em.verify || null;
+      if (!T.em.ready) toast('Saved, but some details are still missing.', true);
+      else if (T.verify && !T.verify.ok) toast('Saved, but the check failed. See the message on the page.', true);
+      else toast('Email settings saved and checked.');
+      renderLens(true);
     } catch (e) { toast('Could not save: ' + e.message, true); }
   };
   const refreshLog = async () => { try { T.log = await api('/api/notifications?limit=60'); } catch { /* keep old */ } renderLens(true); };
+  $('#emVerify').onclick = async () => {
+    $('#emVerify').disabled = true; $('#emVerify').textContent = 'Checking';
+    try { T.verify = await api('/api/settings/email/verify'); } catch (e) { T.verify = { ok: false, message: e.message }; }
+    renderLens(true);
+  };
   $('#emTest').onclick = async () => {
     if (T.dirtyMail) { toast('Save the email settings first, then send a test.', true); return; }
     const to = $('#emTestTo').value.trim();
