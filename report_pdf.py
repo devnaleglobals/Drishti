@@ -117,7 +117,7 @@ def build(inc: dict) -> bytes:
     story.append(Paragraph("Price and index", ST["h2"]))
     pr = [["Move vs previous close", _pc(t.get("move")), f"{t.get('benchmark', 'Index')} move", _pc(t.get("index_move"))],
           ["Index-adjusted move", _pc(t.get("adjusted")), p.get("split_label", "Pre-9:30") + " move", _pc(p.get("pre_930"), 100)],
-          ["Move after that", _pc(p.get("post_930"), 100), "Move started (exchange time)", p.get("onset_local") or "–"],
+          ["Move after that", _pc(p.get("post_930"), 100), "Move started", p.get("onset_local") or "–"],
           ["Volume vs 20-day average", ("%.1fx" % p["volume_ratio"]) if p.get("volume_ratio") else "–", "Triggers",
            f"+{t.get('up_pct', t['threshold']):g}% / -{t.get('down_pct', t['threshold']):g}%"]]
     story.append(_table(pr, [48 * mm, 30 * mm, 52 * mm, W - 130 * mm], header=False))
@@ -130,7 +130,10 @@ def build(inc: dict) -> bytes:
         block = [Paragraph(f"{n}. {_t(c['label'])}", ST["h3"]),
                  Paragraph(f"Score {c['score']:.2f} | {_t(c['type'].replace('_', ' '))} | {_t(c['direction'])} | first seen "
                            f"{_t(c['first_time'])} via {_t(c['first_source'])} ({'before' if c['before_onset'] else 'after'} the move started) | "
-                           f"{c['outlets']} outlet(s) | {_t(', '.join(CR.TIERS[x]['label'] for x in c['tiers']))}", ST["small"])]
+                           f"{c['outlets']} outlet(s) | {_t(', '.join(CR.TIERS[x]['label'] for x in c['tiers']))}"
+                           + (f" | linked by {_t('; '.join(c.get('linked_by', [])))}" if c.get("linked_by") else ""), ST["small"])]
+        if c.get("why"):
+            block.append(Paragraph(f"Why it is here: {_t(c['why'])}{' (background context)' if c.get('context') else ''}", ST["small"]))
         if c.get("summary"):
             block.append(Paragraph(_t(c["summary"]), ST["p"]))
         for i in c["items"][:4]:

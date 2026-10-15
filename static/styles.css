@@ -419,3 +419,8 @@ tr.edit-row td { background: var(--panel-2); border-top: 0; padding: 4px 14px 16
 .tip-item a:hover { color: var(--accent); }
 .tip-item span { color: var(--dim); font-size: .78rem; }
 .tip-more { color: var(--dim); font-size: .78rem; margin-top: 4px; }
+
+.cluster-why { color: var(--dim); font-size: .8rem; margin-top: 4px; }
+.cluster.ctx { opacity: .85; }
+
+.linked-by { font-size: .8rem; color: var(--muted); margin-top: 4px; }

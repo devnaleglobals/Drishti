@@ -95,7 +95,8 @@ def public_config() -> dict:
     env = _env_config()
     src = "app" if raw.get("enabled") and raw.get("provider") else ("env" if env else "none")
     return {
-        "enabled": bool(raw.get("enabled")), "provider": raw.get("provider", "gmail"),
+        # New setups start switched on, so saving a provider and key is enough to use it.
+        "enabled": bool(raw.get("enabled", True)), "provider": raw.get("provider", "brevo"),
         "host": raw.get("host", ""), "port": raw.get("port", 587), "security": raw.get("security", "starttls"),
         "username": raw.get("username", ""), "from_name": raw.get("from_name", "Drishti Alerts"),
         "from_email": raw.get("from_email", ""), "reply_to": raw.get("reply_to", ""),

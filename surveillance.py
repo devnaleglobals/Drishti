@@ -476,7 +476,7 @@ def _mini_report_html(inc: dict, early: dict | None) -> str:
     path = (f'<table cellpadding="5" style="border-collapse:collapse;font-size:13px;margin:6px 0 12px">'
             f'<tr><td style="color:#5B6B7F">{esc(p.get("split_label", "Pre-9:30"))} move</td><td><b>{pc(p.get("pre_930"))}</b></td>'
             f'<td style="color:#5B6B7F;padding-left:18px">After that</td><td><b>{pc(p.get("post_930"))}</b></td></tr>'
-            f'<tr><td style="color:#5B6B7F">Move started</td><td><b>{esc(p.get("onset_local") or "–")}</b> (exchange time)</td>'
+            f'<tr><td style="color:#5B6B7F">Move started</td><td><b>{esc(p.get("onset_local") or "–")}</b></td>'
             f'<td style="color:#5B6B7F;padding-left:18px">Volume</td><td><b>{("%.1fx" % p["volume_ratio"]) if p.get("volume_ratio") else "–"}</b> the 20-day average</td></tr>'
             f'<tr><td style="color:#5B6B7F">Day range</td><td>{(p.get("low") or 0):,.2f} to {(p.get("high") or 0):,.2f}</td>'
             f'<td style="color:#5B6B7F;padding-left:18px">Open</td><td>{(p.get("open") or 0):,.2f}</td></tr></table>') if p else ""
@@ -576,7 +576,7 @@ def _price_context(symbol: str, trigger: dict) -> dict:
     hit = rel[rel >= thr * 0.3]  # the move "starts" once 30% of the threshold is covered
     onset = hit.index[0] if len(hit) else close.index[0]
     out["onset"] = onset.tz_convert("UTC").isoformat()
-    out["onset_local"] = onset.strftime("%H:%M")
+    out["onset_local"] = onset.tz_convert("Asia/Kolkata").strftime("%H:%M IST") if D.is_indian(symbol) else onset.strftime("%H:%M %Z")
     try:
         daily = D.get_history(symbol, "3mo")
         avg = daily["Volume"].iloc[-21:-1].mean()
@@ -693,7 +693,9 @@ def _investigate(inc: dict) -> None:
                    "url": it["url"], "published": it["published"].isoformat(), "kind": it["kind"], "tier": tier,
                    "connectors": it.get("connectors", []), "coverage": it.get("coverage", 1),
                    "engagement": it.get("engagement"), "reach": it.get("reach"), "minutes_vs_onset": mins,
-                   "time": it["published"].tz_convert("Asia/Kolkata").strftime("%d %b %H:%M IST")})
+                   "group": it.get("group", "company"), "keyword": it.get("keyword", ""),
+                   "time": it["published"].tz_convert("Asia/Kolkata").strftime("%d %b %Y, %H:%M IST"),
+                   "group": it.get("group", "company"), "keyword": it.get("keyword", "")})
     inc["health"] = [{k: h[k] for k in ("id", "name", "kind", "status", "count", "note")} for h in health]
     working = sum(1 for h in health if h["status"] == "ok")
     _step(inc, "collect", "done", f"{len(ev)} items in the window from {working} sources")
@@ -712,7 +714,7 @@ def _investigate(inc: dict) -> None:
     if A.llm_ready(LLM) and ranked_input:
         try:
             trig_txt = (f"{t['move']:+.2f}% vs previous close; {t.get('index_move') or 0:+.2f}% for {t.get('benchmark', 'index')}; "
-                        f"move started around {price.get('onset_local', '?')} exchange time; detected {trig_time.tz_convert('Asia/Kolkata'):%H:%M IST}")
+                        f"move started around {price.get('onset_local', '?')}; detected {trig_time.tz_convert('Asia/Kolkata'):%H:%M IST}")
             result = A.ai_investigate(LLM, inc["name"], sym, trig_txt, ranked_input)
             used_ai = True
         except Exception as e:
@@ -742,9 +744,22 @@ def _investigate(inc: dict) -> None:
              "first_time": mem[0]["time"], "outlets": len({i["source"] for i in mem}),
              "tiers": sorted({i["tier"] for i in mem}, key=lambda x: list(CR.TIERS).index(x)),
              "engagement": sum(int(i.get("engagement") or 0) for i in mem),
+             "linked_by": sorted({f"{P.GROUP_LABELS.get(i.get('group', 'company'), 'Company')}: {i.get('keyword', '')}"
+                                  for i in mem if i.get("keyword")})[:4],
              "before_onset": mem[0]["minutes_vs_onset"] <= 0,
              "last_seen": mem[-1]["published"]}
+        # Stories that only matched a material or industry keyword are background, not company information.
+        groups = [i.get("group", "company") for i in mem]
+        c["context"] = all(g in ("materials", "industry") for g in groups) and c["type"] != "official_disclosure"
+        main = max(set(groups), key=groups.count)
+        kw = next((i.get("keyword") for i in mem if i.get("group") == main and i.get("keyword")), "")
+        label = P.GROUP_LABELS.get(main, main)
+        c["why"] = (f"Matched {label} keyword: {kw}" if kw else f"From a {label.lower()} search") if main != "company" or kw else ""
+        if any(i["kind"] == "filing" for i in mem):
+            c["why"] = "Filing on the exchange or with the regulator"
         c["score"] = _cluster_score(c, onset, move_dir)
+        if c["context"]:
+            c["score"] = round(c["score"] * 0.6, 3)  # background news rarely explains a single stock's move
         clusters.append(c)
     clusters.sort(key=lambda c: c["score"], reverse=True)
     inc["clusters"] = clusters
@@ -761,24 +776,30 @@ def _investigate(inc: dict) -> None:
     market_wide = t.get("adjusted") is not None and abs(t["move"]) >= thr and abs(t["adjusted"]) < thr
     official = [c for c in clusters if c["type"] == "official_disclosure" and c["direction"] in (want, "neutral")
                 and pd.Timestamp(c["first_seen"]) <= onset + pd.Timedelta(minutes=30) and c["score"] >= 0.2]
-    rumours = [c for c in clusters if c["is_potential_rumour"] and c["score"] >= 0.25]
+    company_cl = [c for c in clusters if not c.get("context")]
+    rumours = [c for c in company_cl if c["is_potential_rumour"] and c["score"] >= 0.25]
     in_mainstream = [c for c in rumours if "mainstream" in c["tiers"]]
-    news = [c for c in clusters if c["type"] == "confirmed_news" and c["direction"] == want and c["score"] >= 0.3]
-    top = clusters[0] if clusters and clusters[0]["score"] >= 0.2 else None
+    news = [c for c in company_cl if c["type"] == "confirmed_news" and c["direction"] == want and c["score"] >= 0.3]
+    pool = company_cl or clusters
+    top = pool[0] if pool and pool[0]["score"] >= 0.2 else None
 
     if market_wide and not rumours:
         cat, action = ("Market-wide movement",
                        f"The move is largely explained by the {t.get('benchmark', 'index')}. Continue routine monitoring.")
     elif official:
+        top = official[0]
         cat, action = ("Explained by exchange disclosure",
                        "The move follows a disclosure already on the exchange. Verify the filing covers the market reaction; no rumour action indicated.")
     elif in_mainstream:
+        top = in_mainstream[0]
         cat, action = ("Potential rumour in mainstream media",
                        "Information not covered by an exchange disclosure is circulating in mainstream media. Consider seeking confirmation, denial or clarification from the company.")
     elif rumours:
+        top = rumours[0]
         cat, action = ("Potential rumour on social media or online sources",
                        "Unverified information is circulating outside mainstream media. Monitor its spread; escalate if it reaches mainstream media.")
     elif news:
+        top = news[0]
         cat, action = ("Explained by public news",
                        "Confirmed public news explains the direction of the move. Check whether a related exchange disclosure is due.")
     else:
@@ -836,14 +857,15 @@ def _report_context(inc: dict) -> str:
              f"Move vs previous close {t['move']:+.2f}%; {t.get('benchmark', 'index')} {idx_txt}; "
              f"index-adjusted {adj_txt}; threshold {t['threshold']:.1f}%",
              f"{p.get('split_label', 'Pre-9:30')} move {pc(p.get('pre_930'))}; after that {pc(p.get('post_930'))}; "
-             f"move started around {p.get('onset_local', 'n/a')} exchange time; volume {vol_txt}",
+             f"move started around {p.get('onset_local', 'n/a')}; volume {vol_txt}",
              f"Computed assessment: material movement {'YES' if a['material'] else 'NO'} ({a['material_reason']}); "
              f"category: {a['category']}; potential rumour: {'YES' if a['rumour'] else 'NO'}"
              f"{' (in mainstream media)' if a.get('rumour_in_mainstream') else ''}; suggested action: {a['action']}",
              "", "RANKED STORIES (score 0-1):"]
     ev = {e["id"]: e for e in inc.get("evidence", [])}
     for c in inc.get("clusters", [])[:8]:
-        lines.append(f"- [{c['score']:.2f}] {c['label']} | {c['type']} | {c['direction']} | first seen {c['first_time']} via {c['first_source']} "
+        lines.append(f"- [{c['score']:.2f}] {'(BACKGROUND, matched only a material/industry keyword) ' if c.get('context') else ''}"
+                     f"{c['label']} | {c['type']} | {c['direction']} | first seen {c['first_time']} via {c['first_source']} "
                      f"({'before' if c['before_onset'] else 'after'} the move started) | {c['outlets']} outlets | tiers {', '.join(c['tiers'])}"
                      + (f" | {c['summary']}" if c.get("summary") else ""))
         for i in c["items"][:4]:
@@ -895,7 +917,7 @@ def report_html(inc: dict, full: bool = True) -> str:
     yes = lambda b: f'<b style="color:{"#B42318" if b else "#067647"}">{"YES" if b else "NO"}</b>'
     rows = [("Move vs previous close", pc(t.get("move"))), (f"{t.get('benchmark', 'Index')} move", pc(t.get("index_move"))),
             ("Index-adjusted move", pc(t.get("adjusted"))), (p.get("split_label", "Pre-9:30") + " move", pc(p.get("pre_930"), 100)),
-            ("Move after that", pc(p.get("post_930"), 100)), ("Move started (exchange time)", p.get("onset_local") or "–"),
+            ("Move after that", pc(p.get("post_930"), 100)), ("Move started", p.get("onset_local") or "–"),
             ("Volume vs 20-day average", f"{p['volume_ratio']:.1f}x" if p.get("volume_ratio") else "–"),
             ("Threshold", f"{t['threshold']:.1f}%")]
     kv = "".join(f'<tr><td style="padding:6px 10px;color:#5B6B7F">{esc(k)}</td><td style="padding:6px 10px"><b>{esc(str(v))}</b></td></tr>' for k, v in rows)
@@ -909,6 +931,7 @@ def report_html(inc: dict, full: bool = True) -> str:
                f'<div style="color:#5B6B7F;font-size:13px;margin:4px 0">Score {c["score"]:.2f} | {esc(c["type"].replace("_", " "))} | {esc(c["direction"])} | '
                f'first seen {esc(c["first_time"])} via {esc(c["first_source"])} ({"before" if c["before_onset"] else "after"} the move started) | '
                f'{c["outlets"]} outlet(s) | {esc(", ".join(CR.TIERS[x]["label"] for x in c["tiers"]))}</div>'
+               + (f'<div style="font-size:12px;color:#8DA2BA">Why it is here: {esc(c["why"])}{" (background context)" if c.get("context") else ""}</div>' if c.get("why") else "")
                + (f'<div style="font-size:14px">{esc(c["summary"])}</div>' if c.get("summary") else "")
                + f'<ul style="margin:6px 0 0;padding-left:18px;font-size:13px">{srcs}</ul></div>')
     if not cl:
@@ -1040,7 +1063,7 @@ def send_digest(cfg: dict | None = None) -> tuple[bool, str]:
     incs = [i for i in list_incidents() if pd.Timestamp(i["created"]).tz_convert("Asia/Kolkata").date() == today]
     open_cases = [i for i in list_incidents() if i.get("case") not in ("closed",)]
     inc_rows = "".join(
-        f'<tr><td>{pd.Timestamp(i["created"]).tz_convert("Asia/Kolkata"):%H:%M}</td><td><b>{esc(i["symbol"])}</b></td>'
+        f'<tr><td>{pd.Timestamp(i["created"]).tz_convert("Asia/Kolkata"):%H:%M IST}</td><td><b>{esc(i["symbol"])}</b></td>'
         f'<td align="right">{i["trigger"]["move"]:+.2f}%</td><td>{"YES" if i.get("material") else "NO" if i.get("material") is not None else ""}</td>'
         f'<td>{esc(i.get("category") or i["status"])}</td><td>{esc(CASE_STATUS.get(i.get("case", "open"), ""))}</td></tr>' for i in incs) \
         or '<tr><td colspan="6" style="color:#5B6B7F">No incidents today.</td></tr>'

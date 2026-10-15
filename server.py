@@ -181,7 +181,7 @@ def quote_payload(symbol: str) -> dict:
             pts.append({"time": int(t.timestamp() + off), "value": float(v)})  # exchange wall-clock time
     out = {k: q.get(k) for k in ("last", "prev_close", "open", "high", "low", "volume", "currency",
                                   "change", "change_pct", "market_open")}
-    out["as_of"] = q["as_of"].strftime("%d %b %Y, %H:%M") if q.get("as_of") is not None else None
+    out["as_of"] = q["as_of"].strftime("%d %b %Y, %H:%M %Z").replace("+0530", "IST") if q.get("as_of") is not None else None
     out["intraday"] = pts
     out["checked"] = datetime.now().strftime("%H:%M:%S")
     return clean(out)
@@ -454,7 +454,7 @@ def ai_report(req: ReportReq):
         md = A.ai_postmortem(LLM, ctx["company"], req.symbol, ctx["summary"], ctx["events"])
     except Exception as e:
         raise HTTPException(502, _ai_fail("report", e))
-    return {"markdown": md, "generated": datetime.now().strftime("%d %b %Y, %H:%M")}
+    return {"markdown": md, "generated": pd.Timestamp.now(tz="Asia/Kolkata").strftime("%d %b %Y, %H:%M IST")}
 
 
 @app.post("/api/ai/chat")

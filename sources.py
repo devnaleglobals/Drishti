@@ -615,6 +615,7 @@ def _availability(c, symbol):
 # Run everything
 # --------------------------------------------------------------------------
 TRUSTED = {"yahoo", "nse_filings", "bse_filings", "finnhub", "custom_feeds"}
+LENIENT = {"google_news", "bing_news"}
 
 
 def _norm(t: str) -> str:
@@ -655,6 +656,9 @@ def fetch_all(symbol: str, profile: dict, days: int, region: str):
     matcher = ctx["matcher"]
     merged: dict[str, dict] = {}
     health = []
+    names = [t for t in profile.get("company", []) if " " in t.strip()] or profile.get("company", [])
+    lead = names[0].split()[0] if names else ""
+    lead_rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(lead) + r"(?![A-Za-z0-9])", re.I) if len(lead) >= 3 else None
     for c, items, status, note, ms in results:
         kept, newest, dropped = 0, None, 0
         for it in items:
@@ -666,6 +670,8 @@ def fetch_all(symbol: str, profile: dict, days: int, region: str):
             hit = matcher.match(it["title"] + " " + it.get("summary", ""))
             if hit:
                 it["group"], it["keyword"] = hit
+            elif c["id"] in LENIENT and lead_rx and lead_rx.search(it["title"] + " " + it.get("summary", "")):
+                pass  # Google/Bing already matched the exact full name; headlines often use a short form ("SBI Card")
             elif c["id"] not in TRUSTED:
                 dropped += 1
                 continue

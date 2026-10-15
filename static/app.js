@@ -76,8 +76,16 @@ function qty(v) {
   for (const [d, u] of [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']]) if (v >= d) return (v / d).toFixed(1) + u;
   return String(Math.round(v));
 }
-const fmtDay = s => (s ? new Date(s + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '–');
-const fmtTime = iso => (iso ? new Date(iso).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '–');
+// One time format across the app, always Indian Standard Time: "15 Oct 2026, 14:24 IST".
+const IST = 'Asia/Kolkata';
+const _istParts = (d, opts) => new Intl.DateTimeFormat('en-GB', { timeZone: IST, hour12: false, ...opts }).format(d);
+const fmtDay = s => (s ? new Date(s + 'T00:00:00').toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '–');
+const fmtTime = iso => {
+  if (!iso) return '–';
+  const d = new Date(iso);
+  if (isNaN(d)) return '–';
+  return `${_istParts(d, { day: '2-digit', month: 'short', year: 'numeric' })}, ${_istParts(d, { hour: '2-digit', minute: '2-digit' })} IST`;
+};
 const statusWord = s => ({ positive: 'Positive', negative: 'Negative', caution: 'Watch', neutral: 'Neutral' }[s] || 'Neutral');
 const vPill = v => `<span class="pill ${VERDICT[v]?.cls || 'neutral'}">${esc(v)}</span>`;
 
@@ -249,7 +257,8 @@ function startStream() {
   es.onerror = () => { $('#tkState').innerHTML = '<span class="dot"></span>Reconnecting'; };
   S.es = es;
 }
-const localTime = (opts = {}) => new Date().toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, ...opts });
+const localTime = (opts = {}) => opts.day ? fmtTime(new Date().toISOString())
+  : `${_istParts(new Date(), { hour: '2-digit', minute: '2-digit', second: '2-digit' })} IST`;
 function onQuote(q) {
   q.checked = localTime();  // the server may run in UTC, so show the viewer's own clock
   const prev = S.quote?.last;
@@ -1080,7 +1089,7 @@ RENDER.keywords = main => {
 function stopSvPoll() { if (S.svTimer) { clearTimeout(S.svTimer); S.svTimer = null; } }
 function svPoll(fn, ms) { stopSvPoll(); S.svTimer = setTimeout(fn, ms); }
 const yesNo = (b, strong = true) => `<span class="yn ${b ? 'yes' : 'no'}">${b ? 'YES' : 'NO'}</span>`;
-const istTime = iso => iso ? new Date(iso).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }) : '–';
+const istTime = fmtTime;
 const TYPE_LABEL = { official_disclosure: 'Official disclosure', confirmed_news: 'Confirmed news', unverified_rumour: 'Unverified rumour',
   analysis_opinion: 'Analysis / opinion', social_chatter: 'Social chatter', unrelated: 'Unrelated' };
 const CASE_LABEL = { open: 'Open', review: 'Under review', clarification: 'Clarification sought', monitoring: 'Monitoring', closed: 'Closed' };
@@ -1260,6 +1269,8 @@ RENDER.notify = main => {
       ['Recipients', CF.recipients.length, 'Receive every alert and report'],
       ['Teams / Slack', CF.webhooks.filter(h => h.enabled).length, 'Active webhooks'],
       ['Daily summary', CF.digest_enabled ? CF.digest_time + ' IST' : 'Off', 'Weekdays after market close']]) +
+    (!M.enabled ? `<p class="loading-note" style="color:var(--caution)">The email server settings below are switched off${T.em.env_method ? `, so the server environment (${T.em.env_method.toUpperCase()}) is used instead` : ''}. Turn the switch on and save to use them.</p>` : '') +
+    (T.em.source === 'env' && T.em.env_method === 'smtp' && /onrender\.com$/.test(location.hostname) ? '<p class="loading-note" style="color:var(--loss)">Emails are going through SMTP from the Render environment, which Render blocks. Set up Brevo below and save, then delete the SMTP_ variables in Render.</p>' : '') +
     (T.em.secret_unreadable ? '<p class="loading-note" style="color:var(--loss)">The saved password can no longer be read (the APP_SECRET changed). Please enter it again and save.</p>' : '') +
     `<div class="grid g2"><div class="panel"><div class="lens-head" style="margin-bottom:12px"><div><h3 style="margin:0">Email server</h3></div>
         <label class="switch" title="Use these settings"><input type="checkbox" id="emOn" ${M.enabled ? 'checked' : ''}><span></span></label></div>
@@ -1327,7 +1338,7 @@ RENDER.notify = main => {
     if (!el) return;
     el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', () => { M[key] = num ? +el.value : el.value; markMailDirty(); });
   };
-  $('#emOn').onchange = e => { M.enabled = e.target.checked; md_(); };
+  $('#emOn').onchange = e => { M.enabled = e.target.checked; T.dirtyMail = true; renderLens(true); };
   $('#emProv').onchange = e => {
     M.provider = e.target.value; const pr = T.em.presets[M.provider];
     if (pr.host) { M.host = pr.host; M.port = pr.port; M.security = pr.security; }
@@ -1456,19 +1467,15 @@ function renderIncident(main) {
         ['Index-adjusted', pctv(t.adjusted), `Threshold ${t.threshold}%`, dir(t.adjusted)],
         [esc(p.split_label || 'Pre-9:30'), p.pre_930 == null ? '–' : pct(p.pre_930), 'Opening move', dir(p.pre_930)],
         ['After that', p.post_930 == null ? '–' : pct(p.post_930), 'Intraday move', dir(p.post_930)],
-        ['Move started', esc(p.onset_local || '–'), 'Exchange time'],
+        ['Move started', esc(p.onset_local || '–'), 'Time the move began'],
         ['Volume', p.volume_ratio ? p.volume_ratio.toFixed(1) + 'x' : '–', 'vs 20-day average']]) +
-      (p.series?.length ? `<div class="panel"><h3>Timeline <small>Price today with the threshold, the start of the move, and each item when it was published (red negative, green positive, grey neutral)</small></h3><div class="chart" id="cInc"></div></div>` : '') +
-      (done ? `<div class="panel"><h3>Potential rumours and market information <small>Ranked by how likely each explains the move</small></h3>
-        <div class="clusters">${inc.clusters.map((c, n) => `<div class="cluster ${c.is_potential_rumour ? 'rumour' : ''}">
-          <div class="cluster-score"><b>${c.score.toFixed(2)}</b><div class="bar-track"><div class="bar-fill" style="width:${c.score * 100}%;background:${c.is_potential_rumour ? C.loss : C.blue}"></div></div><span>#${n + 1}</span></div>
-          <div><div class="cluster-title">${esc(c.label)}</div>
-            <div class="side-meta"><span class="pill ${c.type === 'unverified_rumour' || c.type === 'social_chatter' ? 'negative' : c.type === 'official_disclosure' ? 'caution' : 'neutral'}">${TYPE_LABEL[c.type] || esc(c.type)}</span>${dirPill(c.direction)}
-              <span>First seen ${esc(c.first_time)} via ${esc(c.first_source)}</span><span class="${c.before_onset ? 'down' : ''}">${c.before_onset ? 'Before the move started' : 'After the move started'}</span>
-              <span>${c.outlets} outlet${c.outlets > 1 ? 's' : ''}</span><span>${c.tiers.map(x => TIER_LABEL[x]).join(', ')}</span>${c.engagement ? `<span>${c.engagement} engagements</span>` : ''}</div>
-            ${c.summary ? `<p class="cluster-sum">${esc(c.summary)}</p>` : ''}
-            <ul class="cluster-items">${c.items.slice(0, 5).map(i => evById[i] ? `<li><a href="${esc(safeUrl(evById[i].url))}" target="_blank" rel="noopener">${esc(evById[i].title)}</a> <span>${esc(evById[i].source)}, ${esc(evById[i].time)}</span></li>` : '').join('')}</ul></div></div>`).join('')
-          || '<p class="loading-note">No relevant public information found in the trigger window.</p>'}</div></div>
+      (p.series?.length ? `<div class="panel"><h3>Timeline <small>Price today in ${/\.(NS|BO)$/i.test(inc.symbol) ? 'IST' : 'exchange time'}, with the triggers, the start of the move, and each item when it was published (red negative, green positive, grey neutral)</small></h3><div class="chart" id="cInc"></div></div>` : '') +
+      (done ? `<div class="panel"><h3>Potential rumours and company information <small>Ranked by how likely each explains the move</small></h3>
+        <div class="clusters">${inc.clusters.filter(c => !c.context).map((c, n) => clusterHtml(c, n, evById)).join('')
+          || '<p class="loading-note">No company-specific information found in the trigger window.</p>'}</div></div>
+        ${inc.clusters.some(c => c.context) ? `<div class="panel"><h3>Market and material context <small>Background news that matched a material or industry keyword. Shown for completeness; rarely the cause of one stock's move.</small></h3>
+        <div class="clusters">${inc.clusters.filter(c => c.context).map((c, n) => clusterHtml(c, n, evById)).join('')}</div></div>` : ''}
+        
         <div class="panel"><h3>Analyst report <small>${inc.report_ai ? 'Written by ' + esc(S.cfg.label || 'AI') : 'Template report (AI not connected)'}</small></h3><div class="report">${md(inc.report_md)}</div></div>
         <div class="panel"><h3>Evidence trail <small>${inc.evidence.length} items</small></h3><div class="table-wrap"><table><thead><tr><th>Published</th><th class="num">Min vs start</th><th>Source</th><th>Credibility</th>
           <th>Type</th><th>Direction</th><th class="num">Confidence</th><th class="num">Engagement</th><th>Item</th></tr></thead><tbody>
@@ -1533,7 +1540,7 @@ function renderIncident(main) {
         }
         return { t, items: [] };
       };
-      const hhmm = t => new Date(t * 1000).toISOString().slice(11, 16);
+      const hhmm = t => new Date(t * 1000).toISOString().slice(11, 16) + (/\.(NS|BO)$/i.test(inc.symbol) ? ' IST' : '');
       const span = m => { m = Math.abs(m); if (m < 60) return m + ' min'; if (m < 1440) return Math.floor(m / 60) + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : '');
         const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60); return d + ' day' + (d > 1 ? 's' : '') + (h ? ' ' + h + ' h' : ''); };
       const show = (param, pin) => {
@@ -1576,6 +1583,18 @@ function renderIncident(main) {
   });
   main.innerHTML = '<div class="skeleton" style="height:400px"></div>';
   load();
+}
+function clusterHtml(c, n, evById) {
+  return `<div class="cluster ${c.is_potential_rumour ? 'rumour' : ''}">
+          <div class="cluster-score"><b>${c.score.toFixed(2)}</b><div class="bar-track"><div class="bar-fill" style="width:${c.score * 100}%;background:${c.is_potential_rumour ? C.loss : C.blue}"></div></div><span>#${n + 1}</span></div>
+          <div><div class="cluster-title">${esc(c.label)}</div>
+            <div class="side-meta"><span class="pill ${c.type === 'unverified_rumour' || c.type === 'social_chatter' ? 'negative' : c.type === 'official_disclosure' ? 'caution' : 'neutral'}">${TYPE_LABEL[c.type] || esc(c.type)}</span>${dirPill(c.direction)}
+              <span>First seen ${esc(c.first_time)} via ${esc(c.first_source)}</span><span class="${c.before_onset ? 'down' : ''}">${c.before_onset ? 'Before the move started' : 'After the move started'}</span>
+              <span>${c.outlets} outlet${c.outlets > 1 ? 's' : ''}</span><span>${c.tiers.map(x => TIER_LABEL[x]).join(', ')}</span>${c.engagement ? `<span>${c.engagement} engagements</span>` : ''}</div>
+            ${c.linked_by?.length ? `<div class="linked-by">Linked to ${esc(inc.symbol)} by ${c.linked_by.map(esc).join('; ')}</div>` : ''}
+            ${c.why ? `<div class="cluster-why">Why it is here: ${esc(c.why)}</div>` : ''}
+            ${c.summary ? `<p class="cluster-sum">${esc(c.summary)}</p>` : ''}
+            <ul class="cluster-items">${c.items.slice(0, 5).map(i => evById[i] ? `<li><a href="${esc(safeUrl(evById[i].url))}" target="_blank" rel="noopener">${esc(evById[i].title)}</a> <span>${esc(evById[i].source)}, ${esc(evById[i].time)}</span></li>` : '').join('')}</ul></div></div>`;
 }
 function caseHtml(inc) {
   const wf = inc.workflow || { status: 'open', assignee: '', closure: '' };

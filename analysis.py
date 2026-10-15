@@ -447,6 +447,7 @@ def ai_investigate(cfg: dict, company: str, symbol: str, trigger: str, items: li
     Returns {"items": {id: {...}}, "clusters": [...]}."""
     listing = "\n".join(
         f"[{it['id']}] {it['time']} ({it['minutes_vs_onset']:+d} min vs move start) | {it['source']} ({it['tier']}, {it['kind']}) | "
+        f"linked by {it.get('group', 'company')} keyword '{it.get('keyword', '')}' | "
         f"{it['title']} | {it.get('summary', '')[:200]}" for it in items)
     prompt = f"""A material price movement was detected in {company} ({symbol}).
 TRIGGER: {trigger}
@@ -454,7 +455,9 @@ TRIGGER: {trigger}
 Below are public items found around the trigger window. Negative minutes = published BEFORE the move started.
 
 For EACH item decide:
-- relevant: is it really about {company} or something that would move its price?
+- relevant: is it really about {company} or something that would move its price? Items linked only by a materials
+  or industry keyword (e.g. a currency, commodity or competitor story) are relevant ONLY if they plausibly move
+  {company}'s share price that day; otherwise mark relevant false and type "unrelated".
 - direction: "positive", "negative" or "neutral" for the share price
 - type: one of {EVIDENCE_TYPES}
   (official_disclosure = exchange/regulator filing by or about the company; confirmed_news = reported fact attributed to

@@ -105,14 +105,17 @@ def default_profile(symbol: str, info: dict) -> dict:
     text = f"{info.get('sector', '')} {info.get('industry', '')}".lower()
     tickers = []
     for words, tks in _SECTOR_MAP:
-        if any(w in text for w in words):
+        # whole words only: "credit services" must not count as "it services"
+        if any(re.search(r"\b" + re.escape(w), text) for w in words):
             tickers += tks
+    # News keywords come only from commodities the industry actually depends on.
+    materials = _uniq([kw for t in _uniq(tickers) for kw in COMMODITIES[t][1][:1]])
+    # The Materials chart always gets a currency line, but that does not add a news keyword.
     if symbol.upper().endswith((".NS", ".BO")) and "INR=X" not in tickers:
         tickers.append("INR=X")
     if not tickers:
         tickers = ["DX-Y.NYB"]
     tickers = _uniq(tickers)[:4]
-    materials = _uniq([kw for t in tickers for kw in COMMODITIES[t][1][:1]])
 
     return {
         "symbol": symbol, "company": company, "people": people, "products": [], "industry": [],
