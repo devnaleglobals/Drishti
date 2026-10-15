@@ -43,7 +43,15 @@ Trigger -> Investigation -> Evidence -> Output:
 Thresholds are configurable per stock: set them to match NSE/SURV/62122. The tool supports the surveillance
 team's assessment; it does not make the regulatory decision.
 
-Email: set SMTP_* or RESEND_API_KEY (see `.env.example`). Set APP_BASE_URL for links in emails.
+Email is set up in the app (**Setup > Email and notifications**): Gmail, Microsoft 365, Zoho, Amazon SES, any SMTP
+server, Brevo or Resend. Passwords and keys are encrypted (set `APP_SECRET`). On Render's free plan SMTP is blocked:
+use Brevo or Resend. Also there: recipients, Teams/Slack webhooks, the daily summary, and a log of every notification.
+
+Triggers per stock: custom high % and low %, price above / below levels, volume spike (x 20-day average), extra
+recipients. Price and volume alerts within an hour of an incident join it instead of opening a new one.
+
+Each incident is a case: status (Open, Under review, Clarification sought, Monitoring, Closed), assignee, notes,
+closure summary and an audit trail. Set APP_BASE_URL for links in emails.
 
 ## News sources
 | Source | Type | Key needed |

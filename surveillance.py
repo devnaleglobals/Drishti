@@ -40,10 +40,18 @@ _lock = threading.RLock()
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "watchlist": [],            # [{"symbol": "SBICARD.NS", "name": "...", "threshold": null, "enabled": true}]
-    "recipients": [],           # alert and report emails
-    "threshold": 3.0,           # % move that counts as material (per-stock override allowed)
+    # [{"symbol", "name", "up_pct", "down_pct", "price_above", "price_below", "volume_x", "recipients", "enabled"}]
+    # A null value means "use the default".
+    "watchlist": [],
+    "recipients": [],           # alert and report emails for every stock
+    "up_pct": 3.0,              # default rise that triggers (%)
+    "down_pct": 3.0,            # default fall that triggers (%)
+    "volume_x": 0,              # default volume spike trigger (x the 20-day average); 0 = off
     "basis": "either",          # "raw" (vs previous close), "adjusted" (minus index move) or "either"
+    "webhooks": [],             # [{"type": "teams"|"slack"|"generic", "name", "url", "enabled"}]
+    "digest_enabled": False,    # end-of-day summary email
+    "digest_time": "15:45",     # IST
+    "digest_last": None,
     "interval": 60,             # seconds between checks
     "market_hours_only": True,
     "window_hours": 48,         # how far before the move starts to look for information
@@ -62,10 +70,39 @@ LLM: dict = {}  # set by the server
 # --------------------------------------------------------------------------
 def load_config() -> dict:
     try:
-        cfg = {**DEFAULT_CONFIG, **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))}
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        cfg = dict(DEFAULT_CONFIG)
+        saved = {}
+    # Older versions had one "threshold" for both directions.
+    if "threshold" in saved and "up_pct" not in saved:
+        saved["up_pct"] = saved["down_pct"] = saved["threshold"]
+    for w in saved.get("watchlist", []):
+        if w.get("threshold") and w.get("up_pct") is None and w.get("down_pct") is None:
+            w["up_pct"] = w["down_pct"] = w["threshold"]
+    cfg = {**DEFAULT_CONFIG, **saved}
+    cfg.pop("threshold", None)
     return cfg
+
+
+def _num(v, lo=None, hi=None):
+    try:
+        if v in (None, ""):
+            return None
+        x = float(v)
+        if lo is not None and x < lo:
+            return None
+        if hi is not None and x > hi:
+            return None
+        return x
+    except (TypeError, ValueError):
+        return None
+
+
+_EMAIL_RE = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+
+
+def _emails(lst) -> list[str]:
+    return sorted({str(e).strip() for e in (lst or []) if re.match(_EMAIL_RE, str(e).strip())})[:30]
 
 
 def save_config(body: dict) -> dict:
@@ -75,12 +112,10 @@ def save_config(body: dict) -> dict:
         sym = str(w.get("symbol", "")).strip().upper()
         if not re.match(r"^[A-Z0-9&^._=-]{1,25}$", sym):
             continue
-        thr = w.get("threshold")
-        try:
-            thr = float(thr) if thr not in (None, "") else None
-        except ValueError:
-            thr = None
-        wl.append({"symbol": sym, "name": str(w.get("name") or sym)[:80], "threshold": thr,
+        wl.append({"symbol": sym, "name": str(w.get("name") or sym)[:80],
+                   "up_pct": _num(w.get("up_pct"), 0.1, 50), "down_pct": _num(w.get("down_pct"), 0.1, 50),
+                   "price_above": _num(w.get("price_above"), 0), "price_below": _num(w.get("price_below"), 0),
+                   "volume_x": _num(w.get("volume_x"), 1, 50), "recipients": _emails(w.get("recipients")),
                    "enabled": bool(w.get("enabled", True))})
     seen, uniq = set(), []
     for w in wl:
@@ -90,8 +125,16 @@ def save_config(body: dict) -> dict:
     cfg.update(
         enabled=bool(body.get("enabled", cfg["enabled"])),
         watchlist=uniq[:50],
-        recipients=[e.strip() for e in body.get("recipients", cfg["recipients"]) if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(e).strip())][:30],
-        threshold=min(max(float(body.get("threshold", cfg["threshold"])), 0.5), 20.0),
+        recipients=_emails(body.get("recipients", cfg["recipients"])),
+        up_pct=_num(body.get("up_pct", cfg["up_pct"]), 0.1, 50) or cfg["up_pct"],
+        down_pct=_num(body.get("down_pct", cfg["down_pct"]), 0.1, 50) or cfg["down_pct"],
+        volume_x=_num(body.get("volume_x", cfg["volume_x"]), 0, 50) or 0,
+        webhooks=[{"type": h.get("type") if h.get("type") in ("teams", "slack", "generic") else "generic",
+                   "name": str(h.get("name") or h.get("type") or "Webhook")[:40], "url": str(h.get("url", "")).strip(),
+                   "enabled": bool(h.get("enabled", True))}
+                  for h in body.get("webhooks", cfg["webhooks"]) if str(h.get("url", "")).startswith("https://")][:10],
+        digest_enabled=bool(body.get("digest_enabled", cfg["digest_enabled"])),
+        digest_time=body.get("digest_time") if re.match(r"^\d{2}:\d{2}$", str(body.get("digest_time", ""))) else cfg["digest_time"],
         basis=body.get("basis", cfg["basis"]) if body.get("basis", cfg["basis"]) in ("raw", "adjusted", "either") else "either",
         interval=int(min(max(int(body.get("interval", cfg["interval"])), 20), 600)),
         market_hours_only=bool(body.get("market_hours_only", cfg["market_hours_only"])),
@@ -135,8 +178,10 @@ def list_incidents(symbol: str = "", limit: int = 200) -> list[dict]:
         a = inc.get("assessment") or {}
         out.append({"id": inc["id"], "symbol": inc["symbol"], "name": inc.get("name"), "created": inc["created"],
                     "status": inc["status"], "manual": inc.get("manual", False), "trigger": inc["trigger"],
+                    "kind": inc.get("kind", "manual" if inc.get("manual") else "move_" + inc["trigger"].get("direction", "up")),
                     "material": a.get("material"), "rumour": a.get("rumour"), "category": a.get("category"),
-                    "driver": a.get("driver")})
+                    "driver": a.get("driver"), "case": (inc.get("workflow") or {}).get("status", "open"),
+                    "assignee": (inc.get("workflow") or {}).get("assignee", "")})
     out.sort(key=lambda x: x["created"], reverse=True)
     return out[:limit]
 
@@ -156,11 +201,11 @@ def market_open_now() -> bool:
     return 9 * 60 <= t <= 15 * 60 + 40
 
 
-def _threshold(entry: dict, cfg: dict) -> float:
-    return float(entry.get("threshold") or cfg["threshold"])
+def _thresholds(entry: dict, cfg: dict) -> tuple[float, float]:
+    return float(entry.get("up_pct") or cfg["up_pct"]), float(entry.get("down_pct") or cfg["down_pct"])
 
 
-def _evaluate(q: dict, idx_move, thr: float, basis: str) -> dict:
+def _evaluate(q: dict, idx_move, up: float, down: float, basis: str) -> dict:
     move = q.get("change_pct")
     if move is None:
         return {"move": None}
@@ -172,9 +217,48 @@ def _evaluate(q: dict, idx_move, thr: float, basis: str) -> dict:
         value = adj
     else:  # either: whichever crosses further
         value = move if abs(move) >= abs(adj) else adj
+    thr = up if value > 0 else down
     level = int(abs(value) // thr) if thr > 0 else 0
     return {"move": move, "adjusted": adj, "index_move": None if idx_move is None else idx_move * 100,
-            "value": value, "level": level, "direction": "up" if value > 0 else "down", "threshold": thr}
+            "value": value, "level": level, "direction": "up" if value > 0 else "down", "threshold": thr,
+            "up_pct": up, "down_pct": down}
+
+
+_avg_vol: dict = {}
+
+
+def _avg_volume(symbol: str):
+    """20-day average daily volume, refreshed every 6 hours."""
+    hit = _avg_vol.get(symbol)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    try:
+        d = D.get_history(symbol, "3mo")
+        v = float(d["Volume"].iloc[-21:-1].mean()) if len(d) > 5 else None
+    except Exception:
+        v = None
+    _avg_vol[symbol] = (time.time(), v)
+    return v
+
+
+def _recent_incident(symbol: str, minutes: int = 60) -> str | None:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    for i in list_incidents(symbol, limit=5):
+        if pd.Timestamp(i["created"]) >= cutoff:
+            return i["id"]
+    return None
+
+
+def _attach_trigger(inc_id: str, kind: str, reason: str) -> None:
+    with _lock:
+        inc = get_incident(inc_id)
+        if not inc:
+            return
+        inc.setdefault("related_triggers", []).append(
+            {"at": datetime.now(timezone.utc).isoformat(), "kind": kind, "reason": reason})
+        inc.setdefault("audit", []).append({"at": datetime.now(timezone.utc).isoformat(), "by": "system",
+                                            "event": f"Related trigger: {TRIGGER_KINDS.get(kind, kind)}. {reason}"})
+        save_incident(inc)
 
 
 def check_once(cfg: dict | None = None) -> None:
@@ -193,19 +277,53 @@ def check_once(cfg: dict | None = None) -> None:
                     idx_cache[bsym] = D.get_live_quote(bsym).get("change_pct")
                 except Exception:
                     idx_cache[bsym] = None
-            ev = _evaluate(q, idx_cache[bsym], _threshold(entry, cfg), cfg["basis"])
+            up, down = _thresholds(entry, cfg)
+            ev = _evaluate(q, idx_cache[bsym], up, down, cfg["basis"])
+            avg = _avg_volume(sym)
+            vol_x = (q.get("volume") / avg) if (q.get("volume") and avg) else None
             ev.update(last=q.get("last"), prev_close=q.get("prev_close"), currency=q.get("currency"),
-                      benchmark=bname, checked=datetime.now(timezone.utc).isoformat(), market_open=q.get("market_open"))
+                      benchmark=bname, checked=datetime.now(timezone.utc).isoformat(), market_open=q.get("market_open"),
+                      volume_x=vol_x)
             STATE["quotes"][sym] = ev
-            if ev.get("move") is None or ev["level"] < 1:
+            if ev.get("move") is None:
                 continue
             lv = STATE["levels"].setdefault(sym, {})
             if lv.get("date") != today:
                 lv.clear()
-                lv.update(date=today, up=0, down=0)
-            if ev["level"] > lv[ev["direction"]]:
+                lv.update(date=today, up=0, down=0, above=False, below=False, volume=False)
+            name = entry.get("name") or sym
+            # 1. percentage move (custom high / low)
+            if ev["level"] >= 1 and ev["level"] > lv[ev["direction"]]:
                 lv[ev["direction"]] = ev["level"]
-                start_incident(sym, entry.get("name") or sym, ev, manual=False)
+                pct = ev["up_pct"] if ev["direction"] == "up" else ev["down_pct"]
+                reason = (f"{ev['value']:+.2f}% crossed the {'+' if ev['direction'] == 'up' else '-'}{pct * ev['level']:g}% "
+                          f"{'high' if ev['direction'] == 'up' else 'low'} trigger")
+                start_incident(sym, name, ev, manual=False, kind="move_" + ev["direction"], reason=reason)
+                continue
+            last = q.get("last")
+            # Price-level and volume triggers within an hour of an existing incident join that incident
+            # instead of opening a new one (a deeper % move above still opens a new incident).
+            recent = _recent_incident(sym, minutes=60)
+
+            def secondary(kind, reason):
+                if recent:
+                    _attach_trigger(recent, kind, reason)
+                else:
+                    start_incident(sym, name, ev, manual=False, kind=kind, reason=reason)
+            # 2. price levels
+            if entry.get("price_above") and last and last >= entry["price_above"] and not lv["above"]:
+                lv["above"] = True
+                secondary("price_above", f"Price {last:,.2f} rose above the {entry['price_above']:,.2f} alert level")
+                continue
+            if entry.get("price_below") and last and last <= entry["price_below"] and not lv["below"]:
+                lv["below"] = True
+                secondary("price_below", f"Price {last:,.2f} fell below the {entry['price_below']:,.2f} alert level")
+                continue
+            # 3. volume spike
+            vx = entry.get("volume_x") or cfg.get("volume_x") or 0
+            if vx and vol_x and vol_x >= vx and not lv["volume"]:
+                lv["volume"] = True
+                secondary("volume", f"Volume reached {vol_x:.1f}x the 20-day average (alert at {vx:g}x)")
         except Exception as e:
             STATE["last_error"] = f"{sym}: {str(e)[:160]}"
 
@@ -219,6 +337,7 @@ def _loop():
             STATE["market_open"] = is_open
             if cfg["enabled"] and cfg["watchlist"] and (is_open or not cfg["market_hours_only"]):
                 check_once(cfg)
+            _maybe_digest(cfg)
             STATE["last_cycle"] = datetime.now(timezone.utc).isoformat()
         except Exception as e:
             STATE["last_error"] = str(e)[:200]
@@ -241,7 +360,7 @@ def status() -> dict:
     cfg = load_config()
     return {"running": STATE["running"], "last_cycle": STATE["last_cycle"], "next_cycle": STATE["next_cycle"],
             "market_open": market_open_now(), "quotes": STATE["quotes"], "last_error": STATE["last_error"],
-            "email": N.method(), "config": cfg}
+            "email": N.method(), "config": cfg, "webhooks": len([h for h in cfg["webhooks"] if h.get("enabled")])}
 
 
 # --------------------------------------------------------------------------
@@ -259,17 +378,33 @@ def _step(inc: dict, key: str, state: str, note: str = "") -> None:
     save_incident(inc)
 
 
-def start_incident(symbol: str, name: str, ev: dict, manual: bool) -> str:
+TRIGGER_KINDS = {"move_up": "High trigger", "move_down": "Low trigger", "price_above": "Price above level",
+                 "price_below": "Price below level", "volume": "Volume spike", "manual": "Manual investigation"}
+CASE_STATUS = {"open": "Open", "review": "Under review", "clarification": "Clarification sought",
+               "monitoring": "Monitoring", "closed": "Closed"}
+
+
+def recipients_for(symbol: str, cfg: dict | None = None) -> list[str]:
+    cfg = cfg or load_config()
+    entry = next((w for w in cfg["watchlist"] if w["symbol"] == symbol.upper()), {})
+    return _emails(cfg["recipients"] + (entry.get("recipients") or []))
+
+
+def start_incident(symbol: str, name: str, ev: dict, manual: bool, kind: str = "manual", reason: str = "") -> str:
     now = datetime.now(timezone.utc)
     inc = {
         "id": f"{now:%Y%m%d-%H%M%S}-{re.sub(r'[^A-Z0-9]', '', symbol.upper())}-{uuid.uuid4().hex[:4]}",
         "symbol": symbol.upper(), "name": name, "created": now.isoformat(), "status": "investigating",
-        "manual": manual, "trigger": {**ev, "time": now.isoformat()},
+        "manual": manual, "kind": kind, "reason": reason or ("Started manually" if manual else ""),
+        "trigger": {**ev, "time": now.isoformat()},
         "steps": [{"key": k, "label": l, "state": "pending", "note": "", "at": None} for k, l in STEPS],
         "emails": [],
+        "workflow": {"status": "open", "assignee": "", "closure": ""},
+        "notes": [],
+        "audit": [{"at": now.isoformat(), "by": "system", "event": f"Incident opened: {TRIGGER_KINDS.get(kind, kind)}"
+                   + (f". {reason}" if reason else "")}],
     }
-    _step(inc, "trigger", "done", "Started manually" if manual else
-          f"{ev['value']:+.2f}% crossed the {ev['threshold']:.1f}% threshold")
+    _step(inc, "trigger", "done", inc["reason"] or f"{ev['value']:+.2f}% crossed the {ev['threshold']:.1f}% trigger")
     threading.Thread(target=_run, args=(inc["id"],), daemon=True).start()
     return inc["id"]
 
@@ -283,12 +418,23 @@ def investigate_now(symbol: str) -> str:
         idx = D.get_live_quote(bsym).get("change_pct")
     except Exception:
         idx = None
-    ev = _evaluate(q, idx, _threshold(entry, cfg), cfg["basis"])
+    up, down = _thresholds(entry, cfg)
+    ev = _evaluate(q, idx, up, down, cfg["basis"])
     if ev.get("move") is None:
         raise ValueError("No live price available for this symbol right now")
     ev.update(last=q.get("last"), prev_close=q.get("prev_close"), currency=q.get("currency"), benchmark=bname)
     name = entry.get("name") or D.get_profile(symbol).get("name", symbol)
-    return start_incident(symbol, name, ev, manual=True)
+    return start_incident(symbol, name, ev, manual=True, kind="manual",
+                          reason=f"Manual investigation at {ev['move']:+.2f}% vs previous close")
+
+
+def _webhooks(cfg: dict, title: str, lines: list[str], link: str, category: str, data: dict) -> list[str]:
+    out = []
+    for h in cfg.get("webhooks", []):
+        if h.get("enabled", True):
+            ok, msg = N.webhook(h, title, lines, link, category, data)
+            out.append(f"{h.get('name')}: {'delivered' if ok else msg}")
+    return out
 
 
 def _alert_email(inc: dict) -> None:
@@ -304,21 +450,25 @@ def _alert_email(inc: dict) -> None:
     link_txt = ('<p><a href="%s">Open the incident in Drishti</a></p>' % html.escape(link)) if link else ""
     body = f"""<div style="font-family:Arial,sans-serif;font-size:14px;color:#16202C">
 <h2 style="margin:0 0 8px">{html.escape(inc['name'])} ({inc['symbol']}) {arrow} {t['move']:+.2f}%</h2>
-<p style="margin:0 0 12px;color:#5B6B7F">{'Manual investigation' if inc['manual'] else 'Automatic trigger'} at {when}</p>
+<p style="margin:0 0 12px;color:#5B6B7F">{html.escape(TRIGGER_KINDS.get(inc.get('kind', 'manual'), 'Trigger'))} at {when}. {html.escape(inc.get('reason', ''))}</p>
 <table cellpadding="6" style="border-collapse:collapse;font-size:14px">
 <tr><td style="color:#5B6B7F">Last price</td><td><b>{t.get('last') or 0:,.2f}</b> {html.escape(t.get('currency') or '')}</td></tr>
 <tr><td style="color:#5B6B7F">Previous close</td><td>{t.get('prev_close') or 0:,.2f}</td></tr>
 <tr><td style="color:#5B6B7F">Move vs previous close</td><td><b>{t['move']:+.2f}%</b></td></tr>
 <tr><td style="color:#5B6B7F">{html.escape(t.get('benchmark') or 'Index')} move</td><td>{idx_txt}</td></tr>
 <tr><td style="color:#5B6B7F">Index-adjusted move</td><td>{adj_txt}</td></tr>
-<tr><td style="color:#5B6B7F">Threshold</td><td>{t['threshold']:.1f}% ({cfg['basis']})</td></tr></table>
+<tr><td style="color:#5B6B7F">Triggers</td><td>+{t.get('up_pct', t['threshold']):g}% high / -{t.get('down_pct', t['threshold']):g}% low ({cfg['basis']})</td></tr></table>
 <p>The investigation has started: news, filings, social media and forums are being searched for the trigger window.
 The evidence-based report will follow by email.</p>
 {link_txt}
 <p style="color:#8DA2BA;font-size:12px">Automated surveillance alert. For internal assessment; not investment advice.</p></div>"""
-    ok, msg = N.send(cfg["recipients"], subj, body)
+    ok, msg = N.send(recipients_for(inc["symbol"], cfg), subj, body, category="alert")
     inc["emails"].append({"type": "alert", "ok": ok, "message": msg, "at": datetime.now(timezone.utc).isoformat()})
-    _step(inc, "alert", "done" if ok else "skipped", msg)
+    hooks = _webhooks(cfg, subj.replace("[Drishti] ", ""), [inc.get("reason", ""), f"{adj.strip()}" if adj else "",
+                      "Investigation started. The report will follow."], link, "alert",
+                      {"incident": inc["id"], "symbol": inc["symbol"], "move": t["move"]})
+    note = msg + (f". Webhooks: {'; '.join(hooks)}" if hooks else "")
+    _step(inc, "alert", "done" if ok or any("delivered" in h for h in hooks) else "skipped", note)
 
 
 # --------------------------------------------------------------------------
@@ -574,8 +724,13 @@ def _investigate(inc: dict) -> None:
     _step(inc, "report", "done", f"Ready {inc['duration_min']} min after the trigger")
 
     # 6. Email -----------------------------------------------------------------
+    a = inc["assessment"]
+    _webhooks(cfg, f"Report: {inc['symbol']} {t['move']:+.2f}%: {a['category']}",
+              [f"Material movement: {'YES' if a['material'] else 'NO'}", f"Potential rumour: {'YES' if a['rumour'] else 'NO'}",
+               f"Likely driver: {a['driver'] or 'not identified'}", a["action"]], _app_link(inc), "report",
+              {"incident": inc["id"], "assessment": a})
     if cfg["auto_email_report"]:
-        ok, msg = email_report(inc, cfg["recipients"])
+        ok, msg = email_report(inc, recipients_for(sym, cfg))
         _step(inc, "email", "done" if ok else "skipped", msg)
     else:
         _step(inc, "email", "skipped", "Automatic report email is switched off")
@@ -675,7 +830,8 @@ def report_html(inc: dict, full: bool = True) -> str:
     link = _app_link(inc)
     head = (f'<h1 style="font-size:22px;margin:0">{esc(inc["name"])} ({esc(inc["symbol"])}) {"▲" if t["value"] > 0 else "▼"} {t["move"]:+.2f}%</h1>'
             f'<p style="color:#5B6B7F;margin:4px 0 16px">Material price movement report. Trigger {when}'
-            f'{" (manual)" if inc.get("manual") else ""}. Report ready {inc.get("duration_min", "–")} min after the trigger.</p>'
+            f'. {esc(TRIGGER_KINDS.get(inc.get("kind", "manual"), "Trigger"))}: {esc(inc.get("reason", ""))}. '
+            f'Report ready {inc.get("duration_min", "–")} min after the trigger.</p>'
             f'<table style="border-collapse:collapse;margin-bottom:14px;font-size:15px">'
             f'<tr><td style="padding:6px 10px">Material movement</td><td style="padding:6px 10px">{yes(a.get("material"))}</td></tr>'
             f'<tr><td style="padding:6px 10px">Potential rumour</td><td style="padding:6px 10px">{yes(a.get("rumour"))}'
@@ -714,8 +870,101 @@ def email_report(inc: dict, recipients: list[str]) -> tuple[bool, str]:
             f"{'Material' if a.get('material') else 'Not material'}, {a.get('category', 'assessment')}")
     full = report_html(inc, full=True).encode("utf-8")
     ok, msg = N.send(recipients, subj, report_html(inc, full=False),
-                     attachment=(f"{inc['symbol']}_{inc['id'][:15]}_report.html", full, "html"))
+                     attachment=(f"{inc['symbol']}_{inc['id'][:15]}_report.html", full, "html"), category="report")
     inc.setdefault("emails", []).append({"type": "report", "ok": ok, "message": msg, "to": recipients,
                                          "at": datetime.now(timezone.utc).isoformat()})
     save_incident(inc)
+    return ok, msg
+
+
+
+# --------------------------------------------------------------------------
+# Case workflow
+# --------------------------------------------------------------------------
+def update_incident(inc_id: str, body: dict, author: str) -> dict:
+    with _lock:
+        inc = get_incident(inc_id)
+        if not inc:
+            raise KeyError(inc_id)
+        wf = inc.setdefault("workflow", {"status": "open", "assignee": "", "closure": ""})
+        audit = inc.setdefault("audit", [])
+        now = datetime.now(timezone.utc).isoformat()
+        if body.get("status") in CASE_STATUS and body["status"] != wf.get("status"):
+            audit.append({"at": now, "by": author, "event": f"Status: {CASE_STATUS.get(wf.get('status'), wf.get('status'))} to {CASE_STATUS[body['status']]}"})
+            wf["status"] = body["status"]
+        if "assignee" in body and str(body["assignee"]).strip()[:80] != wf.get("assignee", ""):
+            wf["assignee"] = str(body["assignee"]).strip()[:80]
+            audit.append({"at": now, "by": author, "event": f"Assigned to {wf['assignee'] or 'nobody'}"})
+        if "closure" in body and str(body["closure"]).strip() != wf.get("closure", ""):
+            wf["closure"] = str(body["closure"]).strip()[:2000]
+            audit.append({"at": now, "by": author, "event": "Closure summary updated"})
+        if str(body.get("note", "")).strip():
+            inc.setdefault("notes", []).append({"at": now, "by": author, "text": str(body["note"]).strip()[:4000]})
+            audit.append({"at": now, "by": author, "event": "Note added"})
+        save_incident(inc)
+        return inc
+
+
+# --------------------------------------------------------------------------
+# Daily digest
+# --------------------------------------------------------------------------
+def _maybe_digest(cfg: dict) -> None:
+    if not cfg.get("digest_enabled"):
+        return
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    if now.weekday() >= 5:
+        return
+    hh, mm = map(int, cfg["digest_time"].split(":"))
+    if (now.hour, now.minute) < (hh, mm) or cfg.get("digest_last") == now.date().isoformat():
+        return
+    send_digest(cfg)
+    stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+    stored["digest_last"] = now.date().isoformat()
+    with _lock:
+        CONFIG_PATH.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+
+
+def send_digest(cfg: dict | None = None) -> tuple[bool, str]:
+    cfg = cfg or load_config()
+    esc = html.escape
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    rows = ""
+    for w in cfg["watchlist"]:
+        q = STATE["quotes"].get(w["symbol"])
+        if q is None:
+            try:
+                qq = D.get_live_quote(w["symbol"])
+                q = {"last": qq.get("last"), "move": (qq.get("change_pct") or 0) * 100, "adjusted": None, "volume_x": None}
+            except Exception:
+                q = {}
+        up, down = _thresholds(w, cfg)
+        mv = q.get("move")
+        col = "#067647" if (mv or 0) >= 0 else "#B42318"
+        last_txt = "" if not q.get("last") else "{:,.2f}".format(q["last"])
+        rows += (f'<tr><td><b>{esc(w["symbol"])}</b><br><span style="color:#5B6B7F">{esc(w.get("name", ""))}</span></td>'
+                 f'<td align="right">{last_txt}</td>'
+                 f'<td align="right" style="color:{col}"><b>{"" if mv is None else "%+.2f%%" % mv}</b></td>'
+                 f'<td align="right">{"" if q.get("adjusted") is None else "%+.2f%%" % q["adjusted"]}</td>'
+                 f'<td align="right">{"" if not q.get("volume_x") else "%.1fx" % q["volume_x"]}</td>'
+                 f'<td>+{up:g}% / -{down:g}%</td></tr>')
+    incs = [i for i in list_incidents() if pd.Timestamp(i["created"]).tz_convert("Asia/Kolkata").date() == today]
+    open_cases = [i for i in list_incidents() if i.get("case") not in ("closed",)]
+    inc_rows = "".join(
+        f'<tr><td>{pd.Timestamp(i["created"]).tz_convert("Asia/Kolkata"):%H:%M}</td><td><b>{esc(i["symbol"])}</b></td>'
+        f'<td align="right">{i["trigger"]["move"]:+.2f}%</td><td>{"YES" if i.get("material") else "NO" if i.get("material") is not None else ""}</td>'
+        f'<td>{esc(i.get("category") or i["status"])}</td><td>{esc(CASE_STATUS.get(i.get("case", "open"), ""))}</td></tr>' for i in incs) \
+        or '<tr><td colspan="6" style="color:#5B6B7F">No incidents today.</td></tr>'
+    body = (f'<div style="font-family:Arial,sans-serif;font-size:14px;color:#16202C;max-width:820px">'
+            f'<h2 style="margin:0">Daily surveillance summary, {today:%d %b %Y}</h2>'
+            f'<p style="color:#5B6B7F">{len(cfg["watchlist"])} stocks watched, {len(incs)} incident(s) today, {len(open_cases)} open case(s).</p>'
+            f'<h3>Watchlist at close</h3><table cellpadding="6" border="1" style="border-collapse:collapse;border-color:#D0D7E2;font-size:13px">'
+            f'<tr style="background:#EEF2F7"><th>Stock</th><th>Last</th><th>vs prev close</th><th>vs index</th><th>Volume</th><th>Triggers</th></tr>{rows}</table>'
+            f'<h3>Incidents today</h3><table cellpadding="6" border="1" style="border-collapse:collapse;border-color:#D0D7E2;font-size:13px">'
+            f'<tr style="background:#EEF2F7"><th>Time</th><th>Stock</th><th>Move</th><th>Material</th><th>Assessment</th><th>Case</th></tr>{inc_rows}</table>'
+            f'<p style="color:#8DA2BA;font-size:12px;margin-top:20px">Drishti daily summary. For internal assessment; not investment advice.</p></div>')
+    ok, msg = N.send(cfg["recipients"], f"[Drishti] Daily surveillance summary {today:%d %b %Y}: {len(incs)} incident(s)",
+                     body, category="digest")
+    _webhooks(cfg, f"Daily summary {today:%d %b}: {len(incs)} incident(s), {len(open_cases)} open case(s)",
+              [f"{i['symbol']} {i['trigger']['move']:+.2f}%: {i.get('category') or i['status']}" for i in incs[:10]],
+              "", "digest", {})
     return ok, msg

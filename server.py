@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -537,11 +537,73 @@ def sv_email(inc_id: str, body: dict = Body(default={})):
 @app.post("/api/surveillance/test-email")
 def sv_test_email(body: dict = Body(default={})):
     to = body.get("to") or SV.load_config()["recipients"]
-    ok, msg = N.send(to, f"[{AI_NAME}] Test email from Drishti surveillance",
-                     "<p style='font-family:Arial'>Email alerts are working. You will receive material price movement alerts and reports at this address.</p>")
+    if isinstance(to, str):
+        to = [x.strip() for x in to.split(",")]
+    ok, msg = N.send(to, "[Drishti] Test email from surveillance",
+                     "<div style='font-family:Arial;font-size:14px'><p><b>Email alerts are working.</b></p>"
+                     "<p>This address will receive material price movement alerts, reports and daily summaries from Drishti.</p></div>",
+                     category="test")
     if not ok:
         raise HTTPException(400, msg)
     return {"message": msg}
+
+
+def _author(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Basic "):
+        try:
+            return base64.b64decode(auth[6:]).decode().split(":", 1)[0] or "user"
+        except Exception:
+            pass
+    return "user"
+
+
+@app.patch("/api/surveillance/incidents/{inc_id}")
+def sv_update(inc_id: str, request: Request, body: dict = Body(...)):
+    try:
+        return clean(SV.update_incident(inc_id, body, _author(request)))
+    except KeyError:
+        raise HTTPException(404, "Incident not found")
+
+
+@app.post("/api/surveillance/digest")
+def sv_digest():
+    ok, msg = SV.send_digest()
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"message": msg}
+
+
+@app.post("/api/surveillance/test-webhook")
+def sv_test_webhook(body: dict = Body(...)):
+    hook = {"type": body.get("type", "generic"), "url": str(body.get("url", "")), "name": body.get("name", "Test")}
+    if not hook["url"].startswith("https://"):
+        raise HTTPException(400, "The webhook address must start with https://")
+    ok, msg = N.webhook(hook, "Drishti test alert", ["Webhook alerts are working.",
+                        "Material price movement alerts and reports will appear here."], os.getenv("APP_BASE_URL", ""), "test")
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"message": msg}
+
+
+@app.get("/api/settings/email")
+def get_email_settings():
+    return N.public_config()
+
+
+@app.put("/api/settings/email")
+def put_email_settings(body: dict = Body(...)):
+    return N.save_config(body)
+
+
+@app.get("/api/settings/email/diagnose")
+def email_diagnose():
+    return N.diagnose()
+
+
+@app.get("/api/notifications")
+def notifications(limit: int = 100):
+    return N.read_log(max(1, min(limit, 500)))
 
 
 app.mount("/", StaticFiles(directory=BASE / "static", html=True), name="static")
