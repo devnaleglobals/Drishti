@@ -203,18 +203,59 @@ def _fetch_feed(url):
     return _cached(("feed", url), 120, go)  # shared by every stock, refreshed every 2 minutes
 
 
+def _try_feed(url: str):
+    r = _get(url, headers={"Accept": "application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.5"})
+    parsed = feedparser.parse(r.content)
+    return r, parsed
+
+
+def _feed_result(url: str, parsed) -> dict:
+    newest = max((_from_struct(e.get("published_parsed") or e.get("updated_parsed")) for e in parsed.entries
+                  if e.get("published_parsed") or e.get("updated_parsed")), default=None)
+    return {"ok": True, "url": url, "title": parsed.feed.get("title", ""), "entries": len(parsed.entries),
+            "newest": newest.isoformat() if newest is not None else None,
+            "sample": [e.get("title", "") for e in parsed.entries[:3]]}
+
+
 def test_feed(url: str) -> dict:
-    """Used by the 'Test' button when adding a feed."""
+    """Used by the Test button. Accepts a feed address or a normal web page:
+    for a web page it looks for the site's own feed, then falls back to Google News for that site."""
     try:
-        r = _get(url, headers={"Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.5"})
-        parsed = feedparser.parse(r.content)
-        if not parsed.entries:
-            return {"ok": False, "error": "No articles found. Check that this is an RSS or Atom feed address."}
-        newest = max((_from_struct(e.get("published_parsed") or e.get("updated_parsed")) for e in parsed.entries
-                      if e.get("published_parsed") or e.get("updated_parsed")), default=None)
-        return {"ok": True, "title": parsed.feed.get("title", ""), "entries": len(parsed.entries),
-                "newest": newest.isoformat() if newest is not None else None,
-                "sample": [e.get("title", "") for e in parsed.entries[:3]]}
+        r, parsed = _try_feed(url)
+        if parsed.entries:
+            return _feed_result(url, parsed)
+        # A normal web page: look for <link rel="alternate" type="application/rss+xml" href="...">
+        from urllib.parse import urljoin
+        html_text = r.text[:400000]
+        found = []
+        for tag in re.findall(r"<link[^>]+>", html_text, re.I):
+            if re.search(r"type=[\"'](application/(rss|atom)\+xml)", tag, re.I):
+                m = re.search(r"href=[\"']([^\"']+)", tag, re.I)
+                if m:
+                    found.append(urljoin(url, html.unescape(m.group(1))))
+        for cand in found[:4]:
+            try:
+                _, p2 = _try_feed(cand)
+                if p2.entries:
+                    res = _feed_result(cand, p2)
+                    res["discovered"] = True
+                    res["note"] = "That was a web page. Found the site's own feed instead."
+                    return res
+            except Exception:
+                continue
+        host = _domain(url)
+        if host:
+            gurl = f"https://news.google.com/rss/search?q={quote_plus('site:' + host)}&hl=en-IN&gl=IN&ceid=IN:en"
+            try:
+                _, p3 = _try_feed(gurl)
+                if p3.entries:
+                    res = _feed_result(gurl, p3)
+                    res["discovered"] = True
+                    res["note"] = f"{host} has no feed of its own, so this uses Google News for that site."
+                    return res
+            except Exception:
+                pass
+        return {"ok": False, "error": "No articles found. This is not an RSS or Atom feed, and no feed could be found for the site."}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
 

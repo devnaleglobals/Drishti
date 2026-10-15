@@ -1018,7 +1018,8 @@ RENDER.keywords = main => {
     out.textContent = 'Testing...';
     try {
       const r = await post('/api/settings/test-feed', { url });
-      out.innerHTML = r.ok ? `<span class="up">Works.</span> ${esc(r.title || '')} has ${r.entries} articles${r.newest ? ', newest ' + ago(r.newest) : ''}. Latest: ${esc((r.sample || [])[0] || '')}`
+      if (r.ok && r.discovered) $('#nfUrl').value = r.url;   // swap in the feed that was found
+      out.innerHTML = r.ok ? `<span class="up">Works.</span> ${r.note ? esc(r.note) + ' ' : ''}${esc(r.title || '')} has ${r.entries} articles${r.newest ? ', newest ' + ago(r.newest) : ''}. Latest: ${esc((r.sample || [])[0] || '')}`
         : `<span class="down">Does not work.</span> ${esc(r.error)}`;
       if (r.ok && !$('#nfName').value.trim() && r.title) $('#nfName').value = r.title.slice(0, 60);
     } catch (e) { out.innerHTML = `<span class="down">${esc(e.message)}</span>`; }
