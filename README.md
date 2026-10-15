@@ -24,6 +24,27 @@ Manual start: `pip install -r requirements.txt` then `python server.py`.
 | Risk | Volatility, beta, drawdown, VaR, return distribution |
 | AI analyst / Ask AI | Written post-mortem and chat on the data |
 
+## Surveillance: material price movement
+Lenses **Monitor and alerts** and **Incidents and reports** (all other lenses unchanged).
+
+Trigger -> Investigation -> Evidence -> Output:
+1. **Trigger.** A background monitor checks every watched stock against its previous close and the index
+   (default every 60 s in market hours). A move past the threshold (default 3%, raw or index-adjusted) opens an incident;
+   each further level (6%, 9%...) triggers again that day. An alert email goes out immediately.
+2. **Investigation.** All sources are searched for the window before the move; the move is split into pre-9:30 and
+   post-9:30 parts and the start of the move is found; each item is timed against that start.
+3. **Evidence.** Source, link, publish time, minutes before/after the move, credibility tier (official, mainstream,
+   other online, social), engagement, AI direction, type (official disclosure, confirmed news, unverified rumour,
+   analysis, social chatter), confidence and story cluster (duplicate detection).
+4. **Output.** Material movement Yes/No, potential rumour Yes/No (and whether it is in mainstream media), likely driver,
+   suggested action, ranked stories, AI analyst report, evidence trail. Report is shown in the app, downloadable, and
+   emailed automatically (or on demand).
+
+Thresholds are configurable per stock: set them to match NSE/SURV/62122. The tool supports the surveillance
+team's assessment; it does not make the regulatory decision.
+
+Email: set SMTP_* or RESEND_API_KEY (see `.env.example`). Set APP_BASE_URL for links in emails.
+
 ## News sources
 | Source | Type | Key needed |
 |---|---|---|
@@ -36,6 +57,10 @@ Manual start: `pip install -r requirements.txt` then `python server.py`.
 | YouTube | Video | `YOUTUBE_API_KEY` |
 | NewsAPI.org | 80,000+ news sites | `NEWSAPI_KEY` |
 | Finnhub | US company news | `FINNHUB_KEY` |
+| BSE announcements | Official filings | No (add the BSE scrip code on the Keywords lens) |
+| SEBI updates | Regulator orders and releases | No |
+| ValuePickr | Indian stock forum | No |
+| X (Twitter) | Social | `X_BEARER_TOKEN` (paid X API) |
 | Custom RSS | Company press releases / IR | Add on the Keywords and sources lens |
 
 Each stock has a keyword profile (company names, leadership, products, competitors, materials, exclusions, commodities),

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -31,7 +31,10 @@ import analysis as A  # noqa: E402
 import data as D  # noqa: E402
 import lenses as L  # noqa: E402
 import profiles as P  # noqa: E402
+import settings as SET  # noqa: E402
 import sources as S  # noqa: E402
+import notify as N  # noqa: E402
+import surveillance as SV  # noqa: E402
 
 app = FastAPI(title="Headline Impact")
 
@@ -96,6 +99,7 @@ LLM = load_llm()
 # The name users see for the AI. The real provider and model are never shown.
 AI_NAME = os.getenv("AI_DISPLAY_NAME", "AI Analyst")
 LLM["display_name"] = AI_NAME
+SV.LLM = LLM
 
 
 def _ai_fail(where: str, e: Exception) -> str:
@@ -240,7 +244,7 @@ def _profile_and_feed(symbol: str, days: int):
     info = cached(("profile", symbol), 3600, lambda: D.get_profile(symbol))
     kp = P.load(symbol, info)
     region = "IN" if D.is_indian(symbol) else "US"
-    version = kp.get("updated") or "auto"
+    version = (kp.get("updated") or "auto", SET.version())  # new keywords or source settings mean a fresh fetch
     items, health = cached(("feed", symbol, days, version), 150, lambda: S.fetch_all(symbol, kp, days, region))
     return info, kp, [dict(i) for i in items], health
 
@@ -384,6 +388,30 @@ def reset_keywords(symbol: str):
     return clean({"profile": P.load(symbol, info)})
 
 
+def _source_settings(symbol: str = ""):
+    return clean({"sources": S.catalogue(symbol), "feeds": S._load_feeds(), "default_feeds": S.default_feeds(),
+                  "custom_feeds": bool(SET.load().get("feeds")), "feed_status": S.FEED_STATUS})
+
+
+@app.get("/api/settings/sources")
+def get_source_settings(symbol: str = ""):
+    return _source_settings(symbol)
+
+
+@app.put("/api/settings/sources")
+def put_source_settings(body: dict = Body(...), symbol: str = ""):
+    SET.save(body.get("disabled", []), body.get("feeds"))
+    return _source_settings(symbol)
+
+
+@app.post("/api/settings/test-feed")
+def test_feed(body: dict = Body(...)):
+    url = str(body.get("url", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Enter a full address starting with https://")
+    return S.test_feed(url)
+
+
 @app.post("/api/keywords/{symbol}/suggest")
 def suggest_keywords(symbol: str, body: dict = Body(default={})):
     if not A.llm_ready(LLM):
@@ -440,6 +468,80 @@ def ai_chat(req: ChatReq):
     except Exception as e:
         raise HTTPException(502, _ai_fail("chat", e))
     return {"answer": answer}
+
+
+# --------------------------------------------------------------------------
+# Surveillance: material price movement monitoring
+# --------------------------------------------------------------------------
+@app.on_event("startup")
+def _start_monitor():
+    SV.start()
+
+
+@app.get("/api/surveillance/status")
+def sv_status():
+    return clean(SV.status())
+
+
+@app.put("/api/surveillance/config")
+def sv_config(body: dict = Body(...)):
+    SV.save_config(body)
+    return clean(SV.status())
+
+
+@app.post("/api/surveillance/investigate")
+def sv_investigate(body: dict = Body(...)):
+    sym = str(body.get("symbol", "")).strip().upper()
+    if not sym:
+        raise HTTPException(400, "Symbol required")
+    try:
+        return {"id": SV.investigate_now(sym)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/surveillance/incidents")
+def sv_incidents(symbol: str = ""):
+    return clean(SV.list_incidents(symbol))
+
+
+@app.get("/api/surveillance/incidents/{inc_id}")
+def sv_incident(inc_id: str):
+    inc = SV.get_incident(inc_id)
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+    return clean(inc)
+
+
+@app.get("/api/surveillance/incidents/{inc_id}/report.html")
+def sv_report(inc_id: str):
+    inc = SV.get_incident(inc_id)
+    if not inc or inc.get("status") != "complete":
+        raise HTTPException(404, "Report not ready")
+    return HTMLResponse(SV.report_html(inc, full=True), headers={
+        "Content-Disposition": f'attachment; filename="{inc["symbol"]}_movement_report.html"'})
+
+
+@app.post("/api/surveillance/incidents/{inc_id}/email")
+def sv_email(inc_id: str, body: dict = Body(default={})):
+    inc = SV.get_incident(inc_id)
+    if not inc or inc.get("status") != "complete":
+        raise HTTPException(404, "Report not ready")
+    to = [e.strip() for e in (body.get("to") or SV.load_config()["recipients"]) if "@" in str(e)]
+    ok, msg = SV.email_report(inc, to)
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"message": msg}
+
+
+@app.post("/api/surveillance/test-email")
+def sv_test_email(body: dict = Body(default={})):
+    to = body.get("to") or SV.load_config()["recipients"]
+    ok, msg = N.send(to, f"[{AI_NAME}] Test email from Drishti surveillance",
+                     "<p style='font-family:Arial'>Email alerts are working. You will receive material price movement alerts and reports at this address.</p>")
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"message": msg}
 
 
 app.mount("/", StaticFiles(directory=BASE / "static", html=True), name="static")

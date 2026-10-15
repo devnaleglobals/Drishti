@@ -116,7 +116,7 @@ def default_profile(symbol: str, info: dict) -> dict:
 
     return {
         "symbol": symbol, "company": company, "people": people, "products": [], "industry": [],
-        "materials": materials, "exclude": [], "commodities": tickers, "extra_feeds": [],
+        "materials": materials, "exclude": [], "commodities": tickers, "extra_feeds": [], "bse_code": "",
         "auto": True, "updated": None,
     }
 
@@ -145,6 +145,8 @@ def validate(symbol: str, prof: dict) -> dict:
     out["commodities"] = [t for t in _uniq(prof.get("commodities") or []) if t in COMMODITIES][:6]
     feeds = [f for f in (prof.get("extra_feeds") or []) if isinstance(f, str) and re.match(r"^https?://", f.strip())]
     out["extra_feeds"] = _uniq(feeds)[:10]
+    code = re.sub(r"\D", "", str(prof.get("bse_code") or ""))
+    out["bse_code"] = code if len(code) == 6 else ""
     out["auto"] = bool(prof.get("auto", False))
     out["updated"] = prof.get("updated")
     if not out["company"]:

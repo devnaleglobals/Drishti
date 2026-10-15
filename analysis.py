@@ -433,3 +433,79 @@ JSON only, no prose."""
     if a == -1 or b == -1:
         raise ValueError("AI did not return a keyword profile")
     return json.loads(text[a: b + 1])
+
+
+# --------------------------------------------------------------------------
+# Surveillance: classify + cluster evidence, write the incident report
+# --------------------------------------------------------------------------
+EVIDENCE_TYPES = ["official_disclosure", "confirmed_news", "unverified_rumour", "analysis_opinion",
+                  "social_chatter", "unrelated"]
+
+
+def ai_investigate(cfg: dict, company: str, symbol: str, trigger: str, items: list[dict]) -> dict:
+    """items: dicts with id, time, minutes_vs_onset, source, tier, kind, title, summary.
+    Returns {"items": {id: {...}}, "clusters": [...]}."""
+    listing = "\n".join(
+        f"[{it['id']}] {it['time']} ({it['minutes_vs_onset']:+d} min vs move start) | {it['source']} ({it['tier']}, {it['kind']}) | "
+        f"{it['title']} | {it.get('summary', '')[:200]}" for it in items)
+    prompt = f"""A material price movement was detected in {company} ({symbol}).
+TRIGGER: {trigger}
+
+Below are public items found around the trigger window. Negative minutes = published BEFORE the move started.
+
+For EACH item decide:
+- relevant: is it really about {company} or something that would move its price?
+- direction: "positive", "negative" or "neutral" for the share price
+- type: one of {EVIDENCE_TYPES}
+  (official_disclosure = exchange/regulator filing by or about the company; confirmed_news = reported fact attributed to
+   the company or named officials; unverified_rumour = speculation, 'sources said', unconfirmed reports, chatter about
+   deals, raids, resignations, results etc.; analysis_opinion = analyst views, targets, technical commentary)
+- confidence: 0-1, how likely this item explains the price move
+- cluster: a short id grouping items that tell the SAME story (duplicates and near-duplicates share one cluster)
+
+Then describe each cluster: label (max 10 words), summary (max 40 words, neutral wording), direction, type,
+confidence (0-1 that this story explains the move), is_potential_rumour (true if it is unconfirmed market information
+that the company may need to verify, confirm or deny).
+
+Return ONE JSON object:
+{{"items": [{{"id": 0, "relevant": true, "direction": "negative", "type": "unverified_rumour", "confidence": 0.7, "cluster": "c1"}}],
+  "clusters": [{{"cluster": "c1", "label": "...", "summary": "...", "direction": "negative", "type": "unverified_rumour",
+                 "confidence": 0.7, "is_potential_rumour": true}}]}}
+JSON only.
+
+ITEMS:
+{listing}"""
+    text = _complete(cfg, "You are a market surveillance analyst at a stock exchange. You are precise, neutral and "
+                          "never overstate certainty. Reply with JSON only.",
+                     [{"role": "user", "content": prompt}], max_tokens=6000)
+    text = re.sub(r"```(?:json)?", "", text)
+    a, b = text.find("{"), text.rfind("}")
+    data = json.loads(text[a: b + 1])
+    return {"items": {int(x["id"]): x for x in data.get("items", []) if "id" in x},
+            "clusters": data.get("clusters", [])}
+
+
+def ai_incident_report(cfg: dict, context: str) -> str:
+    prompt = f"""Write a concise, evidence-based surveillance report on this material price movement incident.
+
+{context}
+
+Use Markdown with exactly these sections:
+## Summary
+(3-4 sentences: what moved, how much vs the index, whether a likely driver was found)
+## Price and index analysis
+(pre-9:30 vs post-9:30 movement, onset time, volume, index adjustment)
+## Potential rumours and market information
+(ranked; for each: what it says, direction, first seen time and source, spread, whether covered by an exchange disclosure)
+## Timing correlation
+(what was public before the move started vs what came after)
+## Assessment
+(material movement yes/no and why; whether information requiring verification exists; residual uncertainty)
+## Suggested next steps
+(for the compliance / surveillance team, e.g. seek clarification from the company, continue monitoring)
+## Limitations
+
+Rules: cite sources by name and time (IST). Do not invent facts beyond the data. Do not give investment advice.
+Stay under 650 words. Never mention which AI company or model wrote the report."""
+    return _complete(cfg, "You are a senior market surveillance analyst. Neutral, factual, careful with certainty.",
+                     [{"role": "user", "content": prompt}], max_tokens=2500)

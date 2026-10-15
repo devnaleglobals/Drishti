@@ -29,9 +29,10 @@ const LENSES = [
     { id: 'feed', name: 'News feed' }, { id: 'impact', name: 'News impact' }, { id: 'sentiment', name: 'Sentiment' },
     { id: 'attention', name: 'Volume and attention' }] },
   { group: 'AI', items: [{ id: 'analyst', name: 'AI analyst' }, { id: 'ask', name: 'Ask AI' }] },
+  { group: 'Surveillance', items: [{ id: 'monitor', name: 'Monitor and alerts' }, { id: 'incidents', name: 'Incidents and reports' }] },
   { group: 'Setup', items: [{ id: 'keywords', name: 'Keywords and sources' }] },
 ];
-const KIND_LABEL = { news: 'News', filing: 'Filing', forum: 'Forum', video: 'Video' };
+const KIND_LABEL = { news: 'News', filing: 'Filing', forum: 'Forum', video: 'Video', social: 'Social' };
 const GROUP_LABEL = { company: 'Company', people: 'Leadership', products: 'Products', industry: 'Industry', materials: 'Materials' };
 const LINE_COLORS = ['#6FA8FF', '#C792EA', '#4FD1C5', '#F687B3', '#9AE6B4', '#B4C6FC'];
 const FEED_POLL_MS = 120000;
@@ -162,17 +163,21 @@ function initLanding() {
 /* ------------------------------------------------------------------ */
 /* Workspace                                                           */
 /* ------------------------------------------------------------------ */
-function openStock(sym, lens = 'overview') {
+function openStock(sym, lens = 'overview', sub = null) {
+  stopFeedPolling(); stopSvPoll();
+  S.incidentId = lens === 'incidents' ? sub : null;
   S.sym = sym.toUpperCase();
   S.token++;
-  Object.assign(S, { data: null, quote: null, profile: null, loadError: null, aiPending: false });
+  Object.assign(S, { data: null, quote: null, profile: null, loadError: null, aiPending: false, svOverview: null, sv: null });
   S.lens = LENS_NAME[lens] ? lens : 'overview';
   $('#landing').hidden = true;
   $('#workspace').hidden = false;
-  history.replaceState(null, '', `#${S.sym}/${S.lens}`);
+  history.replaceState(null, '', `#${S.sym}/${S.lens}${S.incidentId ? '/' + S.incidentId : ''}`);
   $('#identName').textContent = S.sym;
   $('#identMeta').textContent = '';
   $('#tkPrice').textContent = '–'; $('#tkChg').textContent = ''; $('#tkState').textContent = 'Connecting';
+  S.feed = newFeedState();
+  S.kw = null;
   buildRail();
   renderLens();
   const tk = S.token;
@@ -187,8 +192,6 @@ function openStock(sym, lens = 'overview') {
   }).catch(() => {});
   startStream();
   refreshAnalysis();
-  S.feed = newFeedState();
-  S.kw = null;
   loadFeed();
   startFeedPolling();
 }
@@ -213,7 +216,7 @@ async function loadAnalysis(ai) {
       else if (d.ai_error) toast('AI scoring failed, keyword scoring kept. ' + d.ai_error, true);
     }
     updateRailSignals();
-    if (first || !['live', 'ask', 'analyst', 'feed', 'keywords'].includes(S.lens)) renderLens(true);
+    if (first || !['live', 'ask', 'analyst', 'feed', 'keywords', 'monitor', 'incidents'].includes(S.lens)) renderLens(true);
     return true;
   } catch (e) {
     if (tk !== S.token) return false;
@@ -224,7 +227,8 @@ async function loadAnalysis(ai) {
 }
 
 function goHome() {
-  stopStream(); stopFeedPolling(); S.token++; destroyCharts();
+  stopStream(); stopFeedPolling(); stopSvPoll(); S.token++; destroyCharts();
+  loadLandingSurveillance();
   $('#workspace').hidden = true; $('#landing').hidden = false;
   history.replaceState(null, '', location.pathname);
   document.title = 'Headline Impact';
@@ -278,10 +282,12 @@ function updateRailSignals() {
   $$('.rail-sig').forEach(s => { s.className = 'rail-sig'; });
   (S.data?.overview || []).forEach(t => { const s = $(`[data-sig="${t.lens}"]`); if (s) s.classList.add(t.status); });
 }
-function setLens(id) {
+function setLens(id, sub = null) {
   if (!LENS_NAME[id]) return;
+  stopSvPoll();
   S.lens = id;
-  history.replaceState(null, '', `#${S.sym}/${id}`);
+  S.incidentId = id === 'incidents' ? sub : null;
+  history.replaceState(null, '', `#${S.sym}/${id}${S.incidentId ? '/' + S.incidentId : ''}`);
   $$('.rail-item').forEach(b => b.setAttribute('aria-current', String(b.dataset.lens === id)));
   renderLens();
   $('#lens').scrollTop = 0;
@@ -325,7 +331,7 @@ function renderLens(keepScroll = false) {
   const main = $('#lens');
   const top = keepScroll ? main.scrollTop : 0;
   destroyCharts();
-  const needsData = !['live', 'ask', 'analyst', 'feed', 'keywords'].includes(S.lens);
+  const needsData = !['live', 'ask', 'analyst', 'feed', 'keywords', 'monitor', 'incidents'].includes(S.lens);
   if (needsData && S.loadError) {
     main.innerHTML = head(LENS_NAME[S.lens], '') + `<div class="empty"><h3>Could not load ${esc(S.sym)}</h3>
       <p>${esc(S.loadError)}</p><p>Check the symbol (Indian stocks end in .NS or .BO) and your internet connection.</p>
@@ -370,8 +376,17 @@ RENDER.overview = main => {
     reading: 'A written post-mortem of what moved the stock and what the market ignored.' };
   const order = ['feed', 'impact', 'sentiment', 'materials', 'attention', 'technical', 'relative', 'risk'];
   const tiles = order.map(id => d.overview.find(t => t.lens === id)).filter(Boolean);
+  const svw = S.svOverview;
+  const svTile = { lens: 'monitor', title: 'Surveillance', status: svw?.watched ? 'positive' : 'neutral', pill: svw?.watched ? 'Watching' : 'Not watched',
+    metric: svw ? String(svw.incidents) : '–', label: 'Incidents for this stock',
+    reading: svw?.watched ? `Alerts at ${svw.threshold}% moves.${svw.last ? ' Last incident ' + ago(svw.last) + '.' : ''}` : 'Add this stock to the watchlist to get movement alerts and reports.' };
+  if (!svw) Promise.all([api('/api/surveillance/status'), api('/api/surveillance/incidents?symbol=' + enc(S.sym))]).then(([st, incs]) => {
+    const w = st.config.watchlist.find(x => x.symbol === S.sym && x.enabled);
+    S.svOverview = { watched: !!w, threshold: w ? (w.threshold || st.config.threshold) : st.config.threshold, incidents: incs.length, last: incs[0]?.created };
+    if (S.lens === 'overview') renderLens(true);
+  }).catch(() => {});
   main.innerHTML = head('Overview', `Every lens on ${companyName()} at a glance. Open a tile for the full view.`) +
-    `<div class="tiles">${liveTile()}${tileHtml(timeline)}${tiles.map(tileHtml).join('')}${tileHtml(ai)}</div>
+    `<div class="tiles">${liveTile()}${tileHtml(timeline)}${tiles.map(tileHtml).join('')}${tileHtml(svTile)}${tileHtml(ai)}</div>
      <div class="panel" style="margin-top:16px"><h3>Key findings <small>${esc(fmtDay(d.summary.start))} to ${esc(fmtDay(d.summary.end))}</small></h3>
      <ul class="findings">${(d.findings.length ? d.findings : ['No findings yet for this window.']).map(f => `<li>${esc(f)}</li>`).join('')}</ul></div>`;
 };
@@ -833,7 +848,7 @@ function drawFeed() {
         ${i.why ? `<div class="reaction-why">${esc(i.why)}</div>` : ''}</div></article>`).join('')
     || '<p class="loading-note">Nothing matches these filters.</p>';
   $('#feedHealth').innerHTML = F.health.filter(h => h.status !== 'off').map(h =>
-    `<span class="health ${h.status}" title="${esc(h.note || h.desc)}"><i></i>${esc(h.name)} <b>${h.count}</b></span>`).join('');
+    `<span class="health st-${h.status}" title="${esc(h.note || h.desc)}"><i></i>${esc(h.name)} <b>${h.count}</b></span>`).join('');
 }
 
 /* ------------------------------------------------------------------ */
@@ -883,6 +898,11 @@ RENDER.materials = main => {
 /* ------------------------------------------------------------------ */
 /* Keywords and sources                                                */
 /* ------------------------------------------------------------------ */
+function setSourceState(src) {
+  S.kw.src = src;
+  S.kw.srcEdit = { disabled: new Set(src.sources.filter(x => !x.enabled).map(x => x.id)),
+    feeds: JSON.parse(JSON.stringify(src.feeds)), useDefaults: !src.custom_feeds, dirty: false };
+}
 const KW_HELP = {
   company: 'Names and abbreviations used in the media. Upper-case words such as RIL or the ticker match exactly.',
   people: 'CEO, chairman, founders, CFO. News about them often moves the stock.',
@@ -895,9 +915,10 @@ RENDER.keywords = main => {
   if (!S.kw) {
     main.innerHTML = head('Keywords and sources', 'Loading this company\'s keyword profile.') + '<div class="skeleton" style="height:300px"></div>';
     const tk = S.token;
-    api('/api/keywords/' + enc(S.sym)).then(k => {
+    Promise.all([api('/api/keywords/' + enc(S.sym)), api('/api/settings/sources?symbol=' + enc(S.sym))]).then(([k, src]) => {
       if (tk !== S.token) return;
       S.kw = { ...k, edit: JSON.parse(JSON.stringify(k.profile)), added: new Set(), busy: false };
+      setSourceState(src);
       if (S.lens === 'keywords') renderLens();
     }).catch(e => { main.innerHTML = head('Keywords and sources', '') + `<div class="empty"><h3>Could not load</h3><p>${esc(e.message)}</p></div>`; });
     return;
@@ -909,14 +930,27 @@ RENDER.keywords = main => {
     ${g === 'people' && K.officers.length ? `<p class="kw-help" style="margin-top:10px">From company records: ${K.officers.slice(0, 6).map(o =>
       `<button class="link-btn" data-officer="${esc(o.name)}">${esc(o.name)}</button> <span style="color:var(--dim)">(${esc(o.title)})</span>`).join(', ')}</p>` : ''}</div>`;
   const health = (S.feed?.health?.length ? S.feed.health : null);
-  const srcRows = K.sources.map(src => {
+  const SE = K.srcEdit;
+  const srcRows = K.src.sources.map(src => {
     const h = health?.find(x => x.id === src.id);
-    const status = h ? h.status : src.state === 'off' ? 'off' : 'pending';
+    const on = !SE.disabled.has(src.id);
+    const status = !on ? 'off' : h ? h.status : src.state === 'off' ? 'off' : 'pending';
     const label = { ok: 'Working', empty: 'No results', error: 'Error', off: 'Off', pending: 'Waiting' }[status];
-    return `<tr><td><b>${esc(src.name)}</b><div class="kw-help" style="margin:2px 0 0">${esc(src.desc)}</div></td><td>${KIND_LABEL[src.kind]}</td>
-      <td><span class="health ${status}"><i></i>${label}</span></td><td class="num">${h ? h.count : '–'}</td><td>${h?.newest ? ago(h.newest) : '–'}</td>
-      <td style="color:var(--muted);max-width:320px">${esc((h && h.note) || src.note || '')}</td></tr>`;
+    const note = !on ? 'Switched off here. Turn on and save to use it again.' : src.locked || (h && h.note) || src.note || '';
+    return `<tr><td><label class="switch" title="${src.locked ? esc(src.locked) : on ? 'Switch off' : 'Switch on'}">
+        <input type="checkbox" data-src="${src.id}" ${on && !src.locked ? 'checked' : ''} ${src.locked ? 'disabled' : ''}><span></span></label></td>
+      <td><b>${esc(src.name)}</b><div class="kw-help" style="margin:2px 0 0">${esc(src.desc)}</div></td><td>${KIND_LABEL[src.kind]}</td>
+      <td><span class="health st-${status}"><i></i>${label}</span></td><td class="num">${h && on ? h.count : '–'}</td><td>${h?.newest && on ? ago(h.newest) : '–'}</td>
+      <td style="color:var(--muted);max-width:340px">${esc(note)}</td></tr>`;
   }).join('');
+  const feedRows = region => (SE.feeds[region] || []).map(([name, url], i) => {
+    const st = K.src.feed_status[url];
+    const cls = !st ? 'pending' : st.ok ? 'ok' : 'error';
+    const txt = !st ? 'Not checked yet' : st.ok ? `${st.entries} articles${st.newest ? ', newest ' + ago(st.newest) : ''}` : st.error;
+    return `<tr><td>${esc(name)}</td><td class="feed-url" title="${esc(url)}">${esc(url)}</td>
+      <td><span class="health st-${cls}"><i></i>${esc(txt)}</span></td>
+      <td><button class="icon-btn" data-rmfeed="${region}|${i}" aria-label="Remove ${esc(name)}">✕</button></td></tr>`;
+  }).join('') || '<tr><td colspan="4" style="color:var(--muted)">No feeds.</td></tr>';
   main.innerHTML = head('Keywords and sources', `What the app searches for ${companyName()} across every source.`,
     `<div style="display:flex;gap:10px;flex-wrap:wrap">${K.ai_enabled ? `<button class="btn ghost" id="kwSuggest" ${K.busy ? 'disabled' : ''}>${K.busy ? 'AI is thinking' : 'Suggest with AI'}</button>` : ''}
      <button class="btn ghost" id="kwReset">Reset to automatic</button><button class="btn" id="kwSave">Save and refresh</button></div>`) +
@@ -925,11 +959,25 @@ RENDER.keywords = main => {
     `<div class="kw-grid">${['company', 'people', 'products', 'industry', 'materials', 'exclude'].map(groupPanel).join('')}</div>
     <div class="grid g2"><div class="panel"><h3>Commodities to track <small>Up to 6, shown on the Materials lens</small></h3>
       <div class="kw-commod">${K.commodities.map(c => `<label><input type="checkbox" data-com="${c.ticker}" ${E.commodities.includes(c.ticker) ? 'checked' : ''}> ${esc(c.name)}</label>`).join('')}</div></div>
-    <div class="panel"><h3>Custom RSS feeds <small>Company press releases or investor-relations feeds, one URL per line</small></h3>
-      <textarea id="kwFeeds" rows="7" placeholder="https://www.company.com/press/rss">${esc((E.extra_feeds || []).join('\n'))}</textarea></div></div>
-    <div class="panel"><h3>Sources</h3><div class="table-wrap" style="max-height:none"><table><thead><tr><th>Source</th><th>Type</th><th>Status</th><th class="num">Items</th><th>Newest</th><th>Note</th></tr></thead>
+    <div class="panel"><h3>BSE scrip code <small>6 digits, switches on BSE announcements</small></h3>
+      <input id="kwBse" class="plain-in" inputmode="numeric" maxlength="6" placeholder="e.g. 543066" value="${esc(E.bse_code || '')}">
+      <h3 style="margin-top:18px">Custom RSS feeds <small>Company press releases or investor-relations feeds, one URL per line</small></h3>
+      <textarea id="kwFeeds" rows="5" placeholder="https://www.company.com/press/rss">${esc((E.extra_feeds || []).join('\n'))}</textarea></div></div>
+    <div class="panel"><div class="lens-head" style="margin-bottom:12px"><div><h3 style="margin:0">Sources <small>Settings apply to every stock</small></h3></div>
+      <div style="display:flex;gap:10px">${SE.dirty ? '<span class="loading-note" style="margin:0;align-self:center;color:var(--accent)">Unsaved changes</span>' : ''}
+      <button class="btn" id="srcSave" ${SE.dirty ? '' : 'disabled'}>Save source settings</button></div></div>
+      <div class="table-wrap" style="max-height:none"><table><thead><tr><th>On</th><th>Source</th><th>Type</th><th>Status</th><th class="num">Items</th><th>Newest</th><th>Note</th></tr></thead>
       <tbody>${srcRows}</tbody></table></div>
-      <p class="kw-help" style="margin-top:12px">Sources marked Off need a free key. Add it as an environment variable on Render (Environment tab), then redeploy.</p></div>`;
+      <p class="kw-help" style="margin-top:12px">Switches you can't change need a key in the server environment: add it on Render (Environment tab), then redeploy.</p></div>
+    <div class="panel"><div class="lens-head" style="margin-bottom:8px"><div><h3 style="margin:0">Publisher feeds <small>${K.src.custom_feeds ? 'Your edited list' : 'Default list from feeds.json'}</small></h3>
+      <p class="kw-help" style="margin:4px 0 0">Scanned every 2 minutes for this stock's keywords. India feeds are used for NSE and BSE stocks, global feeds for the rest.</p></div>
+      <button class="btn ghost" id="feedDefaults">Restore defaults</button></div>
+      <div class="grid g2"><div><h3 style="font-size:.92rem">India</h3><div class="table-wrap"><table><tbody>${feedRows('IN')}</tbody></table></div></div>
+      <div><h3 style="font-size:.92rem">Global</h3><div class="table-wrap"><table><tbody>${feedRows('GLOBAL')}</tbody></table></div></div></div>
+      <div class="feed-add"><input id="nfName" placeholder="Name, e.g. NDTV Profit"><input id="nfUrl" placeholder="Feed address, https://...">
+        <select id="nfRegion"><option value="IN">India</option><option value="GLOBAL">Global</option></select>
+        <button class="btn ghost" id="nfTest">Test</button><button class="btn ghost" id="nfAdd">Add feed</button></div>
+      <p class="kw-help" id="nfResult" style="margin:8px 0 0"></p></div>`;
 
   $$('[data-del]', main).forEach(b => b.onclick = () => { const [g, i] = b.dataset.del.split('|'); E[g].splice(+i, 1); renderLens(true); });
   $$('[data-add]', main).forEach(inp => inp.onkeydown = e => {
@@ -945,7 +993,47 @@ RENDER.keywords = main => {
     if (cb.checked) { if (E.commodities.length >= 6) { cb.checked = false; toast('Pick up to 6 commodities.', true); return; } E.commodities.push(t); }
     else E.commodities = E.commodities.filter(x => x !== t);
   });
-  const readFeeds = () => { E.extra_feeds = $('#kwFeeds').value.split('\n').map(x => x.trim()).filter(Boolean); };
+  const markDirty = () => { SE.dirty = true; renderLens(true); };
+  $$('[data-src]', main).forEach(cb => cb.onchange = () => {
+    cb.checked ? SE.disabled.delete(cb.dataset.src) : SE.disabled.add(cb.dataset.src);
+    markDirty();
+  });
+  $$('[data-rmfeed]', main).forEach(b => b.onclick = () => { const [r, i] = b.dataset.rmfeed.split('|'); SE.feeds[r].splice(+i, 1); markDirty(); });
+  $('#feedDefaults').onclick = () => { SE.feeds = JSON.parse(JSON.stringify(K.src.default_feeds)); SE.useDefaults = true; markDirty(); };
+  const nf = () => ({ name: $('#nfName').value.trim(), url: $('#nfUrl').value.trim(), region: $('#nfRegion').value });
+  $('#nfTest').onclick = async () => {
+    const { url } = nf(), out = $('#nfResult');
+    if (!url) { out.textContent = 'Enter a feed address first.'; return; }
+    out.textContent = 'Testing...';
+    try {
+      const r = await post('/api/settings/test-feed', { url });
+      out.innerHTML = r.ok ? `<span class="up">Works.</span> ${esc(r.title || '')} has ${r.entries} articles${r.newest ? ', newest ' + ago(r.newest) : ''}. Latest: ${esc((r.sample || [])[0] || '')}`
+        : `<span class="down">Does not work.</span> ${esc(r.error)}`;
+      if (r.ok && !$('#nfName').value.trim() && r.title) $('#nfName').value = r.title.slice(0, 60);
+    } catch (e) { out.innerHTML = `<span class="down">${esc(e.message)}</span>`; }
+  };
+  $('#nfAdd').onclick = () => {
+    const { name, url, region } = nf();
+    if (!name || !/^https?:\/\//.test(url)) { $('#nfResult').textContent = 'Enter a name and a full address starting with https://'; return; }
+    if ((SE.feeds[region] || []).some(f => f[1] === url)) { $('#nfResult').textContent = 'That feed is already in the list.'; return; }
+    (SE.feeds[region] ||= []).push([name, url]);
+    SE.useDefaults = false;
+    markDirty();
+    toast('Feed added. Save source settings to start using it.');
+  };
+  $('#srcSave').onclick = async () => {
+    try {
+      const feeds = SE.useDefaults ? null : SE.feeds;
+      const r = await fetch('/api/settings/sources?symbol=' + enc(S.sym), { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled: [...SE.disabled], feeds }) });
+      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+      setSourceState(await r.json());
+      toast('Source settings saved. Pulling news again.');
+      S.data = null; S.feed = { ...newFeedState(), timer: S.feed.timer };
+      refreshAnalysis(); loadFeed(); renderLens(true);
+    } catch (e) { toast('Could not save: ' + e.message, true); }
+  };
+  const readFeeds = () => { E.extra_feeds = $('#kwFeeds').value.split('\n').map(x => x.trim()).filter(Boolean); E.bse_code = ($('#kwBse')?.value || '').trim(); };
   $('#kwSave').onclick = async () => {
     readFeeds();
     try {
@@ -983,6 +1071,278 @@ RENDER.keywords = main => {
     if (S.lens === 'keywords') renderLens(true);
   };
 };
+
+/* ------------------------------------------------------------------ */
+/* Surveillance: monitor, incidents, reports                           */
+/* ------------------------------------------------------------------ */
+function stopSvPoll() { if (S.svTimer) { clearTimeout(S.svTimer); S.svTimer = null; } }
+function svPoll(fn, ms) { stopSvPoll(); S.svTimer = setTimeout(fn, ms); }
+const yesNo = (b, strong = true) => `<span class="yn ${b ? 'yes' : 'no'}">${b ? 'YES' : 'NO'}</span>`;
+const istTime = iso => iso ? new Date(iso).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }) : '–';
+const TYPE_LABEL = { official_disclosure: 'Official disclosure', confirmed_news: 'Confirmed news', unverified_rumour: 'Unverified rumour',
+  analysis_opinion: 'Analysis / opinion', social_chatter: 'Social chatter', unrelated: 'Unrelated' };
+const TIER_LABEL = { official: 'Official', mainstream: 'Mainstream media', online: 'Other online', social: 'Social / forum' };
+const dirPill = d => `<span class="pill ${d === 'positive' ? 'positive' : d === 'negative' ? 'negative' : 'neutral'}">${esc(d || 'neutral')}</span>`;
+const pctv = (v, d = 2) => v == null ? '–' : `${v >= 0 ? '+' : ''}${Number(v).toFixed(d)}%`;
+
+async function loadLandingSurveillance() {
+  const box = $('#landingSv');
+  if (!box) return;
+  try {
+    const [st, incs] = await Promise.all([api('/api/surveillance/status'), api('/api/surveillance/incidents')]);
+    const wl = st.config.watchlist.filter(w => w.enabled);
+    const recent = incs.slice(0, 4);
+    box.innerHTML = `<div class="sv-land-head"><span class="ai-status ${st.config.enabled && wl.length ? 'on' : ''}">Surveillance:
+      ${wl.length ? `monitoring ${wl.length} stock${wl.length > 1 ? 's' : ''} (${wl.slice(0, 5).map(w => esc(w.symbol)).join(', ')}${wl.length > 5 ? '...' : ''})` : 'no stocks on the watchlist yet'}</span></div>
+      ${recent.length ? `<div class="sv-land-list">${recent.map(i => `<button class="sv-land-item" data-open-inc="${esc(i.symbol)}|${esc(i.id)}">
+        <b class="${i.trigger.move >= 0 ? 'up' : 'down'}">${esc(i.symbol)} ${pctv(i.trigger.move)}</b>
+        <span>${istTime(i.created)}</span><span>${i.status === 'complete' ? esc(i.category || '') : i.status === 'failed' ? 'Investigation failed' : 'Investigating'}</span></button>`).join('')}</div>` : ''}`;
+    $$('[data-open-inc]', box).forEach(b => b.onclick = () => { const [sym, id] = b.dataset.openInc.split('|'); openStock(sym, 'incidents', id); });
+  } catch { box.innerHTML = ''; }
+}
+
+/* Monitor lens -------------------------------------------------------- */
+RENDER.monitor = main => {
+  if (!S.sv) {
+    main.innerHTML = head('Monitor and alerts', 'Loading the surveillance watchlist.') + '<div class="skeleton" style="height:300px"></div>';
+    api('/api/surveillance/status').then(st => { S.sv = { st, edit: JSON.parse(JSON.stringify(st.config)), dirty: false }; if (S.lens === 'monitor') renderLens(); })
+      .catch(e => { main.innerHTML = head('Monitor and alerts', '') + `<div class="empty"><h3>Could not load</h3><p>${esc(e.message)}</p></div>`; });
+    return;
+  }
+  const V = S.sv, st = V.st, E = V.edit;
+  const inList = E.watchlist.some(w => w.symbol === S.sym);
+  const thrOf = w => w.threshold || E.threshold;
+  const rows = E.watchlist.map((w, i) => {
+    const q = st.quotes[w.symbol];
+    const val = q ? q.value : null, thr = thrOf(w);
+    const state = !w.enabled ? ['off', 'Paused'] : !q || q.move == null ? ['pending', 'Waiting for first check']
+      : Math.abs(val) >= thr ? ['error', 'Triggered'] : Math.abs(val) >= thr * 0.7 ? ['empty', 'Near threshold'] : ['ok', 'Normal'];
+    return `<tr><td><b>${esc(w.symbol)}</b><div class="kw-help" style="margin:0">${esc(w.name || '')}</div></td>
+      <td class="num">${q?.last ? nf(q.last, 2, q.currency) : '–'}</td>
+      <td class="num ${dir(q?.move)}">${pctv(q?.move)}</td><td class="num ${dir(q?.adjusted)}">${pctv(q?.adjusted)}</td>
+      <td class="num"><input class="thr-in" type="number" step="0.5" min="0.5" max="20" data-thr="${i}" value="${w.threshold ?? ''}" placeholder="${E.threshold}">%</td>
+      <td><span class="health st-${state[0]}"><i></i>${state[1]}</span></td><td>${q?.checked ? ago(q.checked) : '–'}</td>
+      <td style="white-space:nowrap"><button class="btn ghost sm" data-inv="${esc(w.symbol)}">Investigate now</button>
+        <label class="switch" title="${w.enabled ? 'Pause' : 'Resume'} monitoring"><input type="checkbox" data-wl-on="${i}" ${w.enabled ? 'checked' : ''}><span></span></label>
+        <button class="icon-btn" data-wl-rm="${i}" aria-label="Remove ${esc(w.symbol)}">✕</button></td></tr>`;
+  }).join('');
+  const emailTxt = st.email === 'smtp' ? 'Email via SMTP' : st.email === 'resend' ? 'Email via Resend' : 'Email not configured';
+  main.innerHTML = head('Monitor and alerts', 'Watches each stock against its previous close and the index. A move past the threshold sends an alert, starts an investigation and produces a report.',
+    `<div style="display:flex;gap:10px;flex-wrap:wrap">${inList ? '' : `<button class="btn ghost" id="wlAddCur">Add ${esc(S.sym)} to watchlist</button>`}
+     <button class="btn" id="svSave" ${V.dirty ? '' : 'disabled'}>${V.dirty ? 'Save changes' : 'Saved'}</button></div>`) +
+    kpis([['Monitoring', st.config.enabled ? (st.market_open || !st.config.market_hours_only ? 'Active' : 'Waiting for market') : 'Paused',
+        st.last_cycle ? `Last check ${ago(st.last_cycle)}` : 'Not checked yet', st.config.enabled ? 'up' : 'down'],
+      ['Stocks watched', st.config.watchlist.filter(w => w.enabled).length, `of ${st.config.watchlist.length} on the list`],
+      ['Market (NSE)', st.market_open ? 'Open' : 'Closed', '9:00 to 15:40 IST, weekdays'],
+      ['Alerts', emailTxt, `${st.config.recipients.length} recipient(s)`, st.email ? '' : 'down']]) +
+    (st.last_error ? `<p class="loading-note" style="color:var(--loss)">Last monitor error: ${esc(st.last_error)}</p>` : '') +
+    `<div class="panel"><h3>Watchlist</h3><div class="table-wrap" style="max-height:none"><table><thead><tr><th>Stock</th><th class="num">Last</th><th class="num">vs prev close</th>
+      <th class="num">vs index</th><th class="num">Threshold</th><th>Status</th><th>Checked</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" style="color:var(--muted)">No stocks yet. Add one below or use the button at the top.</td></tr>'}</tbody></table></div>
+      <div class="feed-add" style="grid-template-columns:2fr 1fr auto"><input id="wlSym" placeholder="Symbol, e.g. SBICARD.NS"><input id="wlName" placeholder="Name (optional)">
+        <button class="btn ghost" id="wlAdd">Add to watchlist</button></div>
+      <p class="kw-help" style="margin-top:10px">Each level triggers once a day: at 3%, again at 6%, and so on, in either direction. "Investigate now" runs the full investigation immediately, even below the threshold.</p></div>
+    <div class="grid g2"><div class="panel"><h3>Trigger rules</h3>
+      <div class="form-grid">
+        <label>Default threshold (%)<input type="number" id="cfThr" step="0.5" min="0.5" max="20" value="${E.threshold}"></label>
+        <label>Measure the move<select id="cfBasis">
+          <option value="either" ${E.basis === 'either' ? 'selected' : ''}>Raw or index-adjusted, whichever is larger</option>
+          <option value="raw" ${E.basis === 'raw' ? 'selected' : ''}>Raw: vs previous close</option>
+          <option value="adjusted" ${E.basis === 'adjusted' ? 'selected' : ''}>Index-adjusted: minus the index move</option></select></label>
+        <label>Check every<select id="cfInt">${[30, 60, 120, 300].map(v => `<option value="${v}" ${E.interval === v ? 'selected' : ''}>${v < 60 ? v + ' seconds' : v / 60 + ' minute' + (v > 60 ? 's' : '')}</option>`).join('')}</select></label>
+        <label>Look back before the move<select id="cfWin">${[12, 24, 48, 72].map(v => `<option value="${v}" ${E.window_hours === v ? 'selected' : ''}>${v} hours</option>`).join('')}</select></label>
+      </div>
+      <label class="toggle" style="margin:12px 0 0"><input type="checkbox" id="cfMkt" ${E.market_hours_only ? 'checked' : ''}> Check only during market hours</label><br>
+      <label class="toggle" style="margin:6px 0 0"><input type="checkbox" id="cfOn" ${E.enabled ? 'checked' : ''}> Monitoring switched on</label>
+      <p class="kw-help" style="margin-top:12px">Set these to match the thresholds in NSE/SURV/62122 for each stock. The defaults (3%, either basis) follow your brief.</p></div>
+    <div class="panel"><h3>Alert recipients</h3>
+      <div class="kw-chips">${E.recipients.map((r, i) => `<span class="kw-chip">${esc(r)}<button data-rc-rm="${i}" aria-label="Remove ${esc(r)}">✕</button></span>`).join('')}
+        <input class="kw-add" id="rcAdd" type="email" placeholder="name@company.com and press Enter"></div>
+      <label class="toggle" style="margin:14px 0 0"><input type="checkbox" id="cfAutoMail" ${E.auto_email_report ? 'checked' : ''}> Email the report automatically when ready</label>
+      <div style="margin-top:14px;display:flex;gap:10px;align-items:center"><button class="btn ghost" id="testMail" ${st.email ? '' : 'disabled'}>Send test email</button>
+        <span class="kw-help" style="margin:0">${st.email ? 'Sends to the saved recipients.' : 'Add SMTP or Resend settings on Render to enable email.'}</span></div></div></div>`;
+
+  const dirty = () => { V.dirty = true; renderLens(true); };
+  const addSym = (sym, name) => {
+    sym = sym.trim().toUpperCase();
+    if (!sym) return;
+    if (E.watchlist.some(w => w.symbol === sym)) { toast(`${sym} is already on the watchlist.`); return; }
+    E.watchlist.push({ symbol: sym, name: name || sym, threshold: null, enabled: true }); dirty();
+  };
+  $('#wlAddCur')?.addEventListener('click', () => addSym(S.sym, S.profile?.name || S.sym));
+  $('#wlAdd').onclick = () => addSym($('#wlSym').value, $('#wlName').value.trim());
+  $$('[data-wl-rm]', main).forEach(b => b.onclick = () => { E.watchlist.splice(+b.dataset.wlRm, 1); dirty(); });
+  $$('[data-wl-on]', main).forEach(c => c.onchange = () => { E.watchlist[+c.dataset.wlOn].enabled = c.checked; dirty(); });
+  $$('[data-thr]', main).forEach(inp => inp.onchange = () => { const v = parseFloat(inp.value); E.watchlist[+inp.dataset.thr].threshold = isNaN(v) ? null : v; dirty(); });
+  $('#cfThr').onchange = e => { E.threshold = parseFloat(e.target.value) || 3; dirty(); };
+  $('#cfBasis').onchange = e => { E.basis = e.target.value; dirty(); };
+  $('#cfInt').onchange = e => { E.interval = +e.target.value; dirty(); };
+  $('#cfWin').onchange = e => { E.window_hours = +e.target.value; dirty(); };
+  $('#cfMkt').onchange = e => { E.market_hours_only = e.target.checked; dirty(); };
+  $('#cfOn').onchange = e => { E.enabled = e.target.checked; dirty(); };
+  $('#cfAutoMail').onchange = e => { E.auto_email_report = e.target.checked; dirty(); };
+  $$('[data-rc-rm]', main).forEach(b => b.onclick = () => { E.recipients.splice(+b.dataset.rcRm, 1); dirty(); });
+  $('#rcAdd').onkeydown = e => {
+    if (e.key !== 'Enter') return;
+    const v = e.target.value.trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { toast('Enter a valid email address.', true); return; }
+    if (!E.recipients.includes(v)) E.recipients.push(v);
+    dirty(); $('#rcAdd')?.focus();
+  };
+  $('#svSave').onclick = async () => {
+    try {
+      const r = await fetch('/api/surveillance/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(E) });
+      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+      const st2 = await r.json();
+      S.sv = { st: st2, edit: JSON.parse(JSON.stringify(st2.config)), dirty: false };
+      toast('Surveillance settings saved.'); renderLens(true);
+    } catch (e) { toast('Could not save: ' + e.message, true); }
+  };
+  $('#testMail').onclick = async () => {
+    try { toast((await post('/api/surveillance/test-email', {})).message); } catch (e) { toast(e.message, true); }
+  };
+  $$('[data-inv]', main).forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'Starting';
+    try {
+      const r = await post('/api/surveillance/investigate', { symbol: b.dataset.inv });
+      toast('Investigation started.');
+      if (b.dataset.inv !== S.sym) openStock(b.dataset.inv, 'incidents', r.id); else setLens('incidents', r.id);
+    } catch (e) { toast(e.message, true); b.disabled = false; b.textContent = 'Investigate now'; }
+  });
+  // live refresh of the watchlist numbers (keeps unsaved edits)
+  svPoll(async () => {
+    if (S.lens !== 'monitor') return;
+    try { const st2 = await api('/api/surveillance/status'); S.sv.st = st2; if (!S.sv.dirty) S.sv.edit = JSON.parse(JSON.stringify(st2.config)); renderLens(true); } catch { /* retry next time */ }
+  }, 15000);
+};
+
+/* Incidents lens ------------------------------------------------------ */
+RENDER.incidents = main => S.incidentId ? renderIncident(main) : renderIncidentList(main);
+
+function renderIncidentList(main) {
+  const scope = S.svScope || 'all';
+  main.innerHTML = head('Incidents and reports', 'Every material price movement the monitor caught, and every manual investigation, with its evidence-based report.',
+    `<div style="display:flex;gap:8px"><button class="filter" data-scope="all" aria-pressed="${scope === 'all'}">All stocks</button>
+     <button class="filter" data-scope="this" aria-pressed="${scope === 'this'}">${esc(S.sym)} only</button></div>`) + '<div id="incList"><div class="skeleton" style="height:240px"></div></div>';
+  $$('[data-scope]', main).forEach(b => b.onclick = () => { S.svScope = b.dataset.scope; renderLens(); });
+  const load = async () => {
+    if (S.lens !== 'incidents' || S.incidentId) return;
+    try {
+      const list = await api('/api/surveillance/incidents' + (scope === 'this' ? '?symbol=' + enc(S.sym) : ''));
+      const el = $('#incList');
+      if (!el) return;
+      el.innerHTML = list.length ? `<div class="panel"><div class="table-wrap" style="max-height:none"><table><thead><tr><th>Detected</th><th>Stock</th><th class="num">Move</th>
+        <th class="num">vs index</th><th>Trigger</th><th>Status</th><th>Material</th><th>Rumour</th><th>Assessment</th></tr></thead><tbody>
+        ${list.map(i => `<tr class="click-row" data-incident="${esc(i.symbol)}|${esc(i.id)}"><td style="white-space:nowrap">${istTime(i.created)}</td>
+          <td><b>${esc(i.symbol)}</b></td><td class="num ${dir(i.trigger.move)}">${pctv(i.trigger.move)}</td><td class="num ${dir(i.trigger.adjusted)}">${pctv(i.trigger.adjusted)}</td>
+          <td>${i.manual ? 'Manual' : 'Automatic'}</td>
+          <td><span class="health st-${i.status === 'complete' ? 'ok' : i.status === 'failed' ? 'error' : 'empty'}"><i></i>${i.status === 'complete' ? 'Report ready' : i.status === 'failed' ? 'Failed' : 'Investigating'}</span></td>
+          <td>${i.material == null ? '–' : yesNo(i.material)}</td><td>${i.rumour == null ? '–' : yesNo(i.rumour)}</td><td>${esc(i.category || '')}</td></tr>`).join('')}
+        </tbody></table></div></div>`
+        : `<div class="empty"><h3>No incidents yet</h3><p>Add stocks on the Monitor and alerts lens. When a stock moves past its threshold, the incident and report appear here.
+           You can also run a manual investigation from there.</p><button class="btn" data-go="monitor">Open Monitor and alerts</button></div>`;
+      if (list.some(i => i.status === 'investigating')) svPoll(load, 5000);
+    } catch (e) { const el = $('#incList'); if (el) el.innerHTML = `<p class="loading-note">${esc(e.message)}</p>`; }
+  };
+  load();
+}
+
+function renderIncident(main) {
+  const id = S.incidentId;
+  const draw = inc => {
+    if (S.lens !== 'incidents' || S.incidentId !== id) return;
+    destroyCharts();
+    const t = inc.trigger, p = inc.price || {}, a = inc.assessment, done = inc.status === 'complete';
+    const evById = Object.fromEntries((inc.evidence || []).map(e => [e.id, e]));
+    const steps = `<div class="steps">${inc.steps.map(s => `<div class="step ${s.state}"><i></i><div><b>${esc(s.label)}</b><span>${esc(s.note || (s.state === 'pending' ? 'Waiting' : ''))}</span></div></div>`).join('')}</div>`;
+    main.innerHTML = `<button class="link-btn" data-back style="margin-bottom:12px">All incidents</button>` +
+      head(`${esc(inc.name)} <span class="${t.move >= 0 ? 'up' : 'down'}">${t.move >= 0 ? '▲' : '▼'} ${Math.abs(t.move).toFixed(2)}%</span>`,
+        `${inc.manual ? 'Manual investigation' : 'Automatic trigger'} on ${esc(inc.symbol)} at ${istTime(t.time)}${done ? `. Report ready ${inc.duration_min} min after the trigger.` : '.'}`,
+        done ? `<div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn ghost" href="/api/surveillance/incidents/${enc(inc.id)}/report.html" download>Download report</a>
+          <button class="btn" id="mailRep">Email report</button></div>` : '') +
+      (inc.status === 'failed' ? `<div class="empty" style="margin-bottom:16px"><h3>The investigation failed</h3><p>${esc(inc.error || '')}</p></div>` : '') +
+      `<div class="panel"><h3>Progress</h3>${steps}</div>` +
+      (done ? `<div class="sv-verdict">
+        <div class="vcard ${a.material ? 'neg' : 'pos'}"><span>Material movement</span>${yesNo(a.material)}<small>${esc(a.material_reason)}</small></div>
+        <div class="vcard ${a.rumour ? 'neg' : 'pos'}"><span>Potential rumour</span>${yesNo(a.rumour)}<small>${a.rumour_in_mainstream ? 'In mainstream media' : a.rumour ? 'Online or social only' : 'None found in the window'}</small></div>
+        <div class="vcard"><span>Assessment</span><b class="vtext">${esc(a.category)}</b><small>${a.market_wide ? 'Index move explains most of it' : ''}</small></div>
+        <div class="vcard"><span>Likely driver</span><b class="vtext">${esc(a.driver || 'Not identified')}</b><small>${a.driver ? 'Score ' + a.driver_score.toFixed(2) + ' of 1' : ''}</small></div></div>
+        <div class="panel sv-action"><b>Suggested action.</b> ${esc(a.action)}</div>` : '') +
+      kpis([['vs previous close', pctv(t.move), `${nf(t.prev_close || 0, 2)} to ${nf(t.last || 0, 2)}`, dir(t.move)],
+        [`${esc(t.benchmark || 'Index')}`, pctv(t.index_move), 'Same day', dir(t.index_move)],
+        ['Index-adjusted', pctv(t.adjusted), `Threshold ${t.threshold}%`, dir(t.adjusted)],
+        [esc(p.split_label || 'Pre-9:30'), p.pre_930 == null ? '–' : pct(p.pre_930), 'Opening move', dir(p.pre_930)],
+        ['After that', p.post_930 == null ? '–' : pct(p.post_930), 'Intraday move', dir(p.post_930)],
+        ['Move started', esc(p.onset_local || '–'), 'Exchange time'],
+        ['Volume', p.volume_ratio ? p.volume_ratio.toFixed(1) + 'x' : '–', 'vs 20-day average']]) +
+      (p.series?.length ? `<div class="panel"><h3>Timeline <small>Price today with the threshold, the start of the move, and each item when it was published (red negative, green positive, grey neutral)</small></h3><div class="chart" id="cInc"></div></div>` : '') +
+      (done ? `<div class="panel"><h3>Potential rumours and market information <small>Ranked by how likely each explains the move</small></h3>
+        <div class="clusters">${inc.clusters.map((c, n) => `<div class="cluster ${c.is_potential_rumour ? 'rumour' : ''}">
+          <div class="cluster-score"><b>${c.score.toFixed(2)}</b><div class="bar-track"><div class="bar-fill" style="width:${c.score * 100}%;background:${c.is_potential_rumour ? C.loss : C.blue}"></div></div><span>#${n + 1}</span></div>
+          <div><div class="cluster-title">${esc(c.label)}</div>
+            <div class="side-meta"><span class="pill ${c.type === 'unverified_rumour' || c.type === 'social_chatter' ? 'negative' : c.type === 'official_disclosure' ? 'caution' : 'neutral'}">${TYPE_LABEL[c.type] || esc(c.type)}</span>${dirPill(c.direction)}
+              <span>First seen ${esc(c.first_time)} via ${esc(c.first_source)}</span><span class="${c.before_onset ? 'down' : ''}">${c.before_onset ? 'Before the move started' : 'After the move started'}</span>
+              <span>${c.outlets} outlet${c.outlets > 1 ? 's' : ''}</span><span>${c.tiers.map(x => TIER_LABEL[x]).join(', ')}</span>${c.engagement ? `<span>${c.engagement} engagements</span>` : ''}</div>
+            ${c.summary ? `<p class="cluster-sum">${esc(c.summary)}</p>` : ''}
+            <ul class="cluster-items">${c.items.slice(0, 5).map(i => evById[i] ? `<li><a href="${esc(safeUrl(evById[i].url))}" target="_blank" rel="noopener">${esc(evById[i].title)}</a> <span>${esc(evById[i].source)}, ${esc(evById[i].time)}</span></li>` : '').join('')}</ul></div></div>`).join('')
+          || '<p class="loading-note">No relevant public information found in the trigger window.</p>'}</div></div>
+        <div class="panel"><h3>Analyst report <small>${inc.report_ai ? 'Written by ' + esc(S.cfg.label || 'AI') : 'Template report (AI not connected)'}</small></h3><div class="report">${md(inc.report_md)}</div></div>
+        <div class="panel"><h3>Evidence trail <small>${inc.evidence.length} items</small></h3><div class="table-wrap"><table><thead><tr><th>Published</th><th class="num">Min vs start</th><th>Source</th><th>Credibility</th>
+          <th>Type</th><th>Direction</th><th class="num">Confidence</th><th class="num">Engagement</th><th>Item</th></tr></thead><tbody>
+          ${inc.evidence.map(e => `<tr><td style="white-space:nowrap">${esc(e.time)}</td><td class="num ${e.minutes_vs_onset <= 0 ? 'down' : ''}">${e.minutes_vs_onset > 0 ? '+' : ''}${e.minutes_vs_onset}</td>
+            <td>${esc(e.source)}</td><td>${TIER_LABEL[e.tier]}</td><td>${TYPE_LABEL[e.type] || esc(e.type)}</td><td>${dirPill(e.direction)}</td><td class="num">${(e.confidence || 0).toFixed(2)}</td>
+            <td class="num">${e.engagement || '–'}</td><td class="title-cell"><a href="${esc(safeUrl(e.url))}" target="_blank" rel="noopener">${esc(e.title)}</a></td></tr>`).join('')}</tbody></table></div></div>
+        <div class="grid g2"><div class="panel"><h3>Sources checked</h3><div class="health-strip">${(inc.health || []).filter(h => h.status !== 'off').map(h => `<span class="health st-${h.status}" title="${esc(h.note || '')}"><i></i>${esc(h.name)} <b>${h.count}</b></span>`).join('')}</div></div>
+        <div class="panel"><h3>Emails</h3>${(inc.emails || []).map(m => `<div class="kw-help" style="margin:0 0 6px"><span class="${m.ok ? 'up' : 'down'}">${m.ok ? 'Sent' : 'Not sent'}</span> ${m.type === 'alert' ? 'Alert' : 'Report'}, ${istTime(m.at)}: ${esc(m.message)}</div>`).join('') || '<p class="kw-help">None yet.</p>'}
+          <div class="feed-add" style="grid-template-columns:1fr auto;margin-top:10px"><input id="mailTo" placeholder="Other addresses, comma separated (optional)"><button class="btn ghost" id="mailRep2">Send</button></div></div></div>` : '');
+    $('[data-back]').onclick = () => setLens('incidents');
+    const send = async to => {
+      try { toast((await post(`/api/surveillance/incidents/${enc(inc.id)}/email`, to ? { to } : {})).message); load(); } catch (e) { toast(e.message, true); }
+    };
+    $('#mailRep')?.addEventListener('click', () => send(null));
+    $('#mailRep2')?.addEventListener('click', () => { const to = $('#mailTo').value.split(',').map(x => x.trim()).filter(Boolean); send(to.length ? to : null); });
+    if (p.series?.length) {
+      const ch = mkChart($('#cInc'), { timeScale: { timeVisible: true, secondsVisible: false } });
+      const ls = ch.addLineSeries({ color: C.text, lineWidth: 2, priceLineVisible: false });
+      ls.setData(p.series);
+      const prev = t.prev_close || p.prev_close;
+      if (prev) {
+        ls.createPriceLine({ price: prev, color: C.dim, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: 'Prev close' });
+        ls.createPriceLine({ price: prev * (1 + t.threshold / 100), color: C.caution, lineStyle: 1, lineWidth: 1, axisLabelVisible: false, title: `+${t.threshold}%` });
+        ls.createPriceLine({ price: prev * (1 - t.threshold / 100), color: C.caution, lineStyle: 1, lineWidth: 1, axisLabelVisible: false, title: `-${t.threshold}%` });
+      }
+      const times = p.series.map(x => x.time);
+      const tz = D_TZ(inc.symbol);
+      const snap = iso => {
+        const s = Math.floor(new Date(iso).getTime() / 1000) + tz;
+        if (s < times[0] || s > times[times.length - 1] + 3600) return null;
+        let best = times[0];
+        for (const x of times) { if (x <= s) best = x; else break; }
+        return best;
+      };
+      const marks = [];
+      const onsetT = p.onset ? snap(p.onset) : null;
+      if (onsetT) marks.push({ time: onsetT, position: 'belowBar', color: C.caution, shape: 'arrowUp', text: 'Move starts' });
+      (inc.evidence || []).forEach(e => {
+        const at = snap(e.published);
+        if (at) marks.push({ time: at, position: 'aboveBar', color: e.direction === 'negative' ? C.loss : e.direction === 'positive' ? C.gain : C.neutral, shape: 'circle', text: '' });
+      });
+      marks.sort((x, y) => x.time - y.time);
+      ls.setMarkers(marks);
+      ch.timeScale().fitContent();
+    }
+    // keep refreshing until every step (including the report email) has finished
+    if (inc.status !== 'failed' && inc.steps.some(s => s.state === 'pending' || s.state === 'running')) svPoll(load, 4000);
+  };
+  const load = () => api(`/api/surveillance/incidents/${enc(id)}`).then(draw).catch(e => {
+    main.innerHTML = `<button class="link-btn" data-back>All incidents</button><div class="empty"><h3>Could not load the incident</h3><p>${esc(e.message)}</p></div>`;
+    $('[data-back]').onclick = () => setLens('incidents');
+  });
+  main.innerHTML = '<div class="skeleton" style="height:400px"></div>';
+  load();
+}
+// Exchange wall-clock offset (seconds) used by the intraday chart; India is UTC+5:30.
+const D_TZ = sym => (/\.(NS|BO)$/i.test(sym) ? 19800 : -4 * 3600);
 
 /* ------------------------------------------------------------------ */
 /* Data sources dialog                                                 */
@@ -1025,7 +1385,17 @@ async function init() {
   initLanding();
 
   $('#rail').addEventListener('click', e => { const b = e.target.closest('[data-lens]'); if (b) setLens(b.dataset.lens); });
-  $('#lens').addEventListener('click', e => { const t = e.target.closest('[data-go]'); if (t) setLens(t.dataset.go); });
+  $('#lens').addEventListener('click', e => {
+    const inc = e.target.closest('[data-incident]');
+    if (inc) {
+      const [sym, id] = inc.dataset.incident.split('|');
+      if (sym !== S.sym) openStock(sym, 'incidents', id); else setLens('incidents', id);
+      return;
+    }
+    const t = e.target.closest('[data-go]');
+    if (t) setLens(t.dataset.go);
+  });
+  loadLandingSurveillance();
   $('#homeBtn').onclick = goHome;
   $('#selPeriod').onchange = e => { S.period = e.target.value; S.data = null; renderLens(); refreshAnalysis(); };
   $('#selDays').onchange = e => { S.days = +e.target.value; S.data = null; renderLens(); refreshAnalysis(); };
@@ -1036,8 +1406,8 @@ async function init() {
   $('[data-close]', dlg).onclick = () => dlg.close();
   dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
 
-  const m = location.hash.match(/^#([^/]+)(?:\/(\w+))?/);
-  if (m) openStock(decodeURIComponent(m[1]), m[2]);
+  const m = location.hash.match(/^#([^/]+)(?:\/(\w+))?(?:\/([\w.-]+))?/);
+  if (m) openStock(decodeURIComponent(m[1]), m[2], m[3]);
   else $('#searchInput').focus();
 }
 
